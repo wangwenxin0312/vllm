@@ -155,3 +155,6 @@ class SchedulerOutput:
 
     # KV Cache Connector metadata.
     kv_connector_metadata: Optional[KVConnectorMetadata] = None
+    
+    # modified slots by sparse algorithm
+    req_sparsed_slots: dict[str, int] = None

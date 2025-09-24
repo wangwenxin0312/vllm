@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A GPU worker class."""
+import copy
 import gc
 import os
 from typing import TYPE_CHECKING, Optional
@@ -15,7 +16,8 @@ from vllm.device_allocator.cumem import CuMemAllocator
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
                               set_custom_all_reduce)
-from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
+from vllm.distributed.kv_transfer import (ensure_kv_transfer_initialized,
+                                          has_kv_transfer_group)
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -24,10 +26,11 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils import GiB_bytes, MemorySnapshot, memory_profiling
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.worker_base import WorkerBase
+from ucm.integration.vllm.ucm_sparse.state import ensure_ucm_sparse_initialized
 
 logger = init_logger(__name__)
 
@@ -313,9 +316,22 @@ class Worker(WorkerBase):
             assert isinstance(output, IntermediateTensors)
             get_pp_group().send_tensor_dict(output.tensors,
                                             all_gather_group=get_tp_group())
-            return None
+            if not has_kv_transfer_group():
+                return None
+
+            # In case of PP with kv transfer, we need to pass through the
+            # finished_sending and finished_recving buffers.
+            new_output = EMPTY_MODEL_RUNNER_OUTPUT
+            if output.finished_sending or output.finished_recving or output.finished_dumping or output.invalid_block_ids:
+                new_output = copy.copy(new_output)
+                new_output.finished_sending = output.finished_sending
+                new_output.finished_recving = output.finished_recving
+                new_output.finished_dumping = output.finished_dumping
+                new_output.invalid_block_ids = output.invalid_block_ids
+            output = new_output
+
         assert isinstance(output, ModelRunnerOutput)
-        return output if self.is_driver_worker else None
+        return output
 
     def profile(self, is_start: bool = True):
         if self.profiler is None:
@@ -386,6 +402,7 @@ def init_worker_distributed_environment(
                                       parallel_config.pipeline_parallel_size)
 
     ensure_kv_transfer_initialized(vllm_config)
+    ensure_ucm_sparse_initialized(vllm_config)
 
 
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):
