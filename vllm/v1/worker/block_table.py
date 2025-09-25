@@ -60,6 +60,15 @@ class BlockTable:
         start = self.num_blocks_per_row[row_idx]
         self.num_blocks_per_row[row_idx] += num_blocks
         self.block_table_np[row_idx, start:start + num_blocks] = block_ids
+    
+    def reset_row(
+            self,
+            row_idx: int,
+    ) -> None:
+        self.num_blocks_per_row[row_idx] = 0
+        self.block_table[row_idx].fill_(0)
+        self.block_table_cpu[row_idx].fill_(0)
+        self.block_table_np[row_idx].fill(0)
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
         self.num_blocks_per_row[row_idx] = 0
@@ -116,6 +125,10 @@ class MultiGroupBlockTable:
                    row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
             block_table.append_row(block_ids[i], row_idx)
+    
+    def reset_row(self, row_idx: int) -> None:
+        for i, block_table in enumerate(self.block_tables):
+            block_table.reset_row(row_idx)
 
     def add_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
