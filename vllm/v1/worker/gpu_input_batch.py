@@ -96,6 +96,9 @@ class InputBatch:
             pin_memory=False,
         )
         self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
+        self.is_token_ids = torch.zeros(
+            (max_num_reqs, max_model_len), device="cpu", dtype=bool, pin_memory=False
+        )
         self.num_tokens = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_tokens_no_spec = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_prompt_tokens = np.zeros(max_num_reqs, dtype=np.int32)
@@ -286,8 +289,14 @@ class InputBatch:
             req_index, :num_prompt_tokens] = request.prompt_token_ids
         start_idx = num_prompt_tokens
         end_idx = start_idx + len(request.output_token_ids)
+        if request.prompt_token_ids is not None:
+            self.token_ids_cpu[req_index, :num_prompt_tokens] = request.prompt_token_ids
+            self.is_token_ids[req_index, :num_prompt_tokens] = True
+        else:
+            self.is_token_ids[req_index, :num_prompt_tokens] = False
         self.token_ids_cpu[req_index,
                            start_idx:end_idx] = request.output_token_ids
+        self.is_token_ids[req_index, start_idx:end_idx] = True
         # Number of token ids in token_ids_cpu.
         # NOTE(woosuk): This may include spec decode tokens.
         self.num_tokens[req_index] = request.num_tokens
@@ -473,6 +482,8 @@ class InputBatch:
         self.token_ids_cpu[i1, ...] = self.token_ids_cpu[i2, ...]
         self.token_ids_cpu[i2, ...] = tmp
 
+        self.is_token_ids[[i1, i2], ...] = self.is_token_ids[[i2, i1], ...]
+
         swap_dict_values(self.generators, i1, i2)
         swap_dict_values(self.bad_words_token_ids, i1, i2)
 
@@ -542,6 +553,9 @@ class InputBatch:
             num_tokens = self.num_tokens[last_req_index]
             self.token_ids_cpu[empty_index, :num_tokens] = self.token_ids_cpu[
                 last_req_index, :num_tokens]
+            self.is_token_ids[empty_index, :num_tokens] = self.is_token_ids[
+                last_req_index, :num_tokens
+            ]
             self.num_tokens[empty_index] = num_tokens
             self.num_tokens_no_spec[empty_index] = self.num_tokens_no_spec[
                 last_req_index]
