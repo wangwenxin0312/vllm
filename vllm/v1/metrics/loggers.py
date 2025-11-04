@@ -96,6 +96,7 @@ class LoggingStatLogger(StatLoggerBase):
             self.last_scheduler_stats = scheduler_stats
 
     def log(self):
+        # print("===[debug begin]")
         now = time.monotonic()
         prompt_throughput = self._get_throughput(self.num_prompt_tokens, now)
         generation_throughput = self._get_throughput(
@@ -464,6 +465,7 @@ class PrometheusStatLogger(StatLoggerBase):
             self.histogram_time_to_first_token.observe(ttft)
         for tpot in iteration_stats.time_per_output_tokens_iter:
             self.histogram_time_per_output_token.observe(tpot)
+            # print("====log", tpot)
 
         for finished_request in iteration_stats.finished_requests:
             self.counter_request_success[finished_request.finish_reason].inc()

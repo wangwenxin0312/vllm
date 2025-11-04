@@ -72,6 +72,9 @@ from ..sample.logits_processor import LogitsProcessorManager
 from .utils import (gather_mm_placeholders, initialize_kv_cache_for_kv_sharing,
                     sanity_check_mm_encoder_outputs, scatter_mm_placeholders)
 
+from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
+from ucm.sparse.base import UcmSparseMetadata, INVALID_SLOT
+
 if TYPE_CHECKING:
     import xgrammar as xgr
     import xgrammar.kernels.apply_token_bitmask_inplace_torch_compile as xgr_torch_compile  # noqa: E501
@@ -365,6 +368,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
+            self.ucm_sparse_request_finished_in_worker(req_id)
             self.requests.pop(req_id, None)
             self.encoder_cache.pop(req_id, None)
         # Remove the finished requests from the persistent batch.
@@ -468,13 +472,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Update the states of the running/resumed requests.
         is_last_rank = get_pp_group().is_last_rank
         req_data = scheduler_output.scheduled_cached_reqs
+        req_sparsed_slots = scheduler_output.req_sparsed_slots
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_data.resumed_from_preemption[i]
+            is_sparsed_request = req_sparsed_slots[req_id] != INVALID_SLOT
 
             # Update the cached states.
+            if (num_computed_tokens <= req_state.num_computed_tokens):
+                # The request was rescheduled after a KV load failure. Clear
+                # the last sampled tokens and rewind the generator state
+                len_output_token_ids = len(req_state.output_token_ids)
+                del req_state.output_token_ids[req_state.
+                                               len_last_output_token_ids:]
+                if req_state.generator:
+                    req_state.generator.set_offset(
+                        req_state.last_generator_offset)
+                req_index = self.input_batch.req_id_to_index.get(req_id)
+                if req_index is not None:
+                    len_last_sampled = (len_output_token_ids -
+                                        req_state.len_last_output_token_ids)
+                    end_idx = self.input_batch.num_tokens_no_spec[
+                        req_index] - len_last_sampled
+                    self.input_batch.num_tokens[req_index] = end_idx
+                    self.input_batch.num_tokens_no_spec[req_index] = end_idx
+
             req_state.num_computed_tokens = num_computed_tokens
 
             if not is_last_rank:
@@ -493,16 +517,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     req_state.output_token_ids.extend(
                         new_token_ids[-num_new_tokens:])
 
+            req_state.len_last_output_token_ids = len(
+                req_state.output_token_ids)
+            if req_state.generator:
+                req_state.last_generator_offset = (
+                    req_state.generator.get_offset())
+
             # Update the block IDs.
-            if not resumed_from_preemption:
-                # Append the new blocks to the existing block IDs.
-                for block_ids, new_ids in zip(req_state.block_ids,
-                                              new_block_ids):
-                    block_ids.extend(new_ids)
-            else:
+            if resumed_from_preemption or is_sparsed_request:
                 # The request is resumed from preemption.
                 # Replace the existing block IDs with the new ones.
                 req_state.block_ids = new_block_ids
+            else:
+                # Append the new blocks to the existing block IDs.
+                for block_ids, new_ids in zip(req_state.block_ids,
+                                               new_block_ids):
+                    block_ids.extend(new_ids)
 
             req_index = self.input_batch.req_id_to_index.get(req_id)
             if req_index is None:
@@ -512,9 +542,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 req_ids_to_add.append(req_id)
                 continue
 
+            if req_state.generator:
+                assert (req_state.last_generator_offset is not None)
+                self.input_batch.generators_last_offset[
+                    req_index] = req_state.last_generator_offset
+
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = (
                 num_computed_tokens)
+            if is_sparsed_request:
+                self.input_batch.block_table.reset_row(req_index)
             self.input_batch.block_table.append_row(new_block_ids, req_index)
 
             # For the last rank, we don't need to update the token_ids_cpu
@@ -623,6 +660,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.uses_mrope:
             self._calc_mrope_positions(scheduler_output)
 
+        self.seq_lens_np[:num_reqs] = (
+            self.input_batch.num_computed_tokens_cpu[:num_reqs] +
+            num_scheduled_tokens)
+
+        # TODO: improve performance, no `positions_np.copy()`
+        sparsed_positions = positions_np.copy()
+        req_sparsed_slots = scheduler_output.req_sparsed_slots
+        for req_id in self.input_batch.req_id_to_index:
+            is_sparsed_request = req_sparsed_slots[req_id] != INVALID_SLOT
+            req_index = self.input_batch.req_id_to_index[req_id]
+            offset = 0 if req_index == 0 else cu_num_tokens[req_index - 1] # TODO: support MTP
+            if is_sparsed_request:
+                sparsed_positions[offset] = req_sparsed_slots[req_id] - 1
         # Get token indices.
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
@@ -652,11 +702,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # block_size.
             block_table_indices = (
                 req_indices * block_table.max_num_blocks_per_req +
-                positions_np // block_size)
+                sparsed_positions // block_size)
             block_table_cpu = block_table.get_cpu_tensor()
             block_numbers = block_table_cpu.flatten(
             )[block_table_indices].numpy()
-            block_offsets = positions_np % block_size
+            block_offsets = sparsed_positions % block_size
             np.add(
                 block_numbers * block_size,
                 block_offsets,
@@ -666,9 +716,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.query_start_loc_np[0] = 0
         self.query_start_loc_np[1:num_reqs + 1] = cu_num_tokens
 
-        self.seq_lens_np[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[:num_reqs] +
-            num_scheduled_tokens)
+        for req_id in self.input_batch.req_id_to_index:
+            req_index = self.input_batch.req_id_to_index[req_id]
+            is_sparsed_request = scheduler_output.req_sparsed_slots[req_id] != INVALID_SLOT
+            if is_sparsed_request:
+                self.seq_lens_np[req_index] = scheduler_output.req_sparsed_slots[req_id]
 
         # Copy the tensors to the GPU.
         self.input_ids[:total_num_scheduled_tokens].copy_(
@@ -680,6 +732,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 non_blocking=True)
         else:
             # Common case (1D positions)
+            self.positions_cpu[:total_num_scheduled_tokens] = torch.from_numpy(
+                positions_np[:total_num_scheduled_tokens])
             self.positions[:total_num_scheduled_tokens].copy_(
                 self.positions_cpu[:total_num_scheduled_tokens],
                 non_blocking=True)
@@ -1370,6 +1424,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 skip_cuda_graphs=skip_cuda_graphs,
         ):
             self.maybe_setup_kv_connector(scheduler_output)
+            self.maybe_execute_ucm_sparse_begin(scheduler_output, attn_metadata)
 
             model_output = self.model(
                 input_ids=input_ids,
@@ -1378,9 +1433,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 inputs_embeds=inputs_embeds,
             )
 
-            self.maybe_wait_for_kv_save()
+            finished_dumping = self.maybe_wait_for_kv_save()
+            self.maybe_execute_ucm_sparse_finished()
+
             finished_sending, finished_recving = (
                 self.get_finished_kv_transfers(scheduler_output))
+            invalid_block_ids = self.get_block_ids_with_load_errors()
 
         if self.use_aux_hidden_state_outputs:
             hidden_states, aux_hidden_states = model_output
@@ -1430,7 +1488,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampler_output = self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
-            )
+            ) # todo: 替换sampler.tokenid
         else:
             # When indexing with a tensor (bonus_logits_indices), PyTorch
             # creates a new tensor with separate storage from the original
@@ -1474,7 +1532,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # This relies on cuda-specific torch-internal impl details
                 generator = self.input_batch.generators.get(i)
                 if generator is not None:
-                    generator.set_offset(generator.get_offset() - 4)
+                    generator.set_offset(
+                        self.input_batch.generators_last_offset.get(i))
                 # Record the index of the request that should not be sampled,
                 # so that we could clear the sampled tokens before returning.
                 discard_sampled_tokens_req_indices.append(i)
@@ -1563,6 +1622,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_sending=finished_sending,
             finished_recving=finished_recving,
             num_nans_in_logits=num_nans_in_logits,
+            finished_dumping=finished_dumping,
+            invalid_block_ids = invalid_block_ids
         )
 
     def propose_draft_token_ids(
@@ -1693,13 +1754,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.maybe_setup_kv_connector(scheduler_output)
             finished_sending, finished_recving = (
                 self.get_finished_kv_transfers(scheduler_output))
+            invalid_block_ids = self.get_block_ids_with_load_errors()
+            get_kv_transfer_group().clear_connector_metadata()
 
-        if not finished_sending and not finished_recving:
+        if not finished_sending and not finished_recving and not invalid_block_ids:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
         output.finished_sending = finished_sending
         output.finished_recving = finished_recving
+        output.invalid_block_ids = invalid_block_ids
         return output
 
     @staticmethod
@@ -1719,9 +1783,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_connector.start_load_kv(get_forward_context())
 
     @staticmethod
-    def maybe_wait_for_kv_save() -> None:
+    def maybe_wait_for_kv_save() -> Optional[dict[str, list[str]]]:
         if has_kv_transfer_group():
-            get_kv_transfer_group().wait_for_save()
+            return get_kv_transfer_group().wait_for_save()
+
+    def maybe_execute_ucm_sparse_begin(self, scheduler_output: "SchedulerOutput", attn_metadata: CommonAttentionMetadata):
+        if not has_ucm_sparse():
+            return
+        ucm_sparse = get_ucm_sparse()
+        ucm_sparse.build_sparse_meta(scheduler_output, self.requests, self.input_batch, attn_metadata)
+        ucm_sparse.execute_begin(scheduler_output)
+
+    def maybe_execute_ucm_sparse_finished(self):
+        if not has_ucm_sparse():
+            return
+        ucm_sparse = get_ucm_sparse()
+        ucm_sparse.execute_finished()
+
+    def ucm_sparse_request_finished_in_worker(self, request_id: str | int):
+        if not has_ucm_sparse():
+            return
+        ucm_sparse = get_ucm_sparse()
+        ucm_sparse.request_finished_in_worker(request_id)
 
     @staticmethod
     def get_finished_kv_transfers(
@@ -1731,6 +1814,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return get_kv_transfer_group().get_finished(
                 scheduler_output.finished_req_ids)
         return None, None
+
+    def get_block_ids_with_load_errors(self) -> Optional[set[int]]:
+        if has_kv_transfer_group():
+            return get_kv_transfer_group().get_block_ids_with_load_errors()
+        return None
 
     def propose_ngram_draft_token_ids(
         self,
