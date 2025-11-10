@@ -35,6 +35,8 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
+from ucm.sparse.state import ensure_ucm_sparse_initialized, get_ucm_sparse, has_ucm_sparse
+from ucm.sparse.base import UcmSparseBase, UcmSparseRole, INVALID_SLOT
 
 logger = init_logger(__name__)
 
@@ -80,12 +82,18 @@ class Scheduler(SchedulerInterface):
         # will have a corresponding KVConnector with Role=WORKER.
         # KV Connector pushes/pull of remote KVs for P/D and offloading.
         self.connector = None
+        self.ucm_sparse = None
         if self.vllm_config.kv_transfer_config is not None:
             assert len(self.kv_cache_config.kv_cache_groups) == 1, (
                 "Multiple KV cache groups are not currently supported "
                 "with KV connectors")
             self.connector = KVConnectorFactory.create_connector_v1(
                 config=self.vllm_config, role=KVConnectorRole.SCHEDULER)
+            # Initialize UCM Sparse if available
+            if "ucm_sparse_config" in vllm_config.kv_transfer_config.kv_connector_extra_config:
+                ensure_ucm_sparse_initialized(vllm_config, role=UcmSparseRole.SCHEDULER)
+                self.ucm_sparse = get_ucm_sparse()
+                logger.info("UCM Sparse initialized successfully: {}".format(self.ucm_sparse))
 
         self.kv_event_publisher = EventPublisherFactory.create(
             self.kv_events_config,
@@ -203,8 +211,13 @@ class Scheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         req_index = 0
+        req_sparsed_slots: dict[str, int] = {}
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            num_slots_sparsed = INVALID_SLOT
+            if self.ucm_sparse:
+                num_slots_sparsed = self.ucm_sparse.estimate_num_slots_sparsed(request)
+            req_sparsed_slots.update({request.request_id: num_slots_sparsed})
 
             num_new_tokens = (request.num_tokens_with_spec -
                               request.num_computed_tokens)
@@ -252,7 +265,8 @@ class Scheduler(SchedulerInterface):
                     request,
                     num_new_tokens,
                     num_draft_tokens=num_draft_tokens,
-                    num_lookahead_tokens=self.num_lookahead_tokens)
+                    num_lookahead_tokens=self.num_lookahead_tokens,
+                    num_slots_sparsed=num_slots_sparsed)
                 if new_blocks is None:
                     # The request cannot be scheduled.
                     # Preempt the lowest-priority request.
@@ -339,6 +353,10 @@ class Scheduler(SchedulerInterface):
                     break
 
                 request = self.waiting.peek_request()
+                num_slots_sparsed = INVALID_SLOT
+                if self.ucm_sparse:
+                    num_slots_sparsed = self.ucm_sparse.estimate_num_slots_sparsed(request)
+                req_sparsed_slots.update({request.request_id: num_slots_sparsed})
 
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -448,6 +466,7 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks,
                     num_lookahead_tokens=self.num_lookahead_tokens,
                     delay_cache_blocks=load_kv_async,
+                    num_slots_sparsed=num_slots_sparsed
                 )
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -561,6 +580,7 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
+            req_sparsed_slots=req_sparsed_slots,
             # finished_req_ids is an existing state in the scheduler,
             # instead of being newly scheduled in this step.
             # It contains the request IDs that are finished in between
@@ -809,16 +829,12 @@ class Scheduler(SchedulerInterface):
             new_logprobs = None
             new_token_ids = generated_token_ids
             kv_transfer_params = None
+
             if model_runner_output.finished_dumping is not None:
                 request.succeed_dumped_blocks.extend(model_runner_output.finished_dumping.get(req_id, []))
                 is_prefill = request.num_output_tokens == 0
                 if is_prefill:
-                    if isinstance(self.connector, MultiConnector):
-                        for c in self.connector._connectors:
-                            if hasattr(c, 'connector') and hasattr(c.connector, 'commit'):
-                                c.connector.commit(model_runner_output.finished_dumping.get(req_id, []), True)
-                    else:
-                        self.connector.connector.commit(model_runner_output.finished_dumping.get(req_id, []), True)
+                    self.connector.connector.commit(model_runner_output.finished_dumping.get(req_id, []), True)
 
             # Append generated tokens and check for stop. Note that if
             # a request is still being prefilled, we expect the model runner
@@ -870,7 +886,6 @@ class Scheduler(SchedulerInterface):
                         spec_token_ids[req_index])
                 else:
                     request.spec_token_ids = spec_token_ids[req_index]
-
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or pooler_output is not None \
@@ -897,6 +912,7 @@ class Scheduler(SchedulerInterface):
 
             if not stopped:
                 new_running.append(request)
+
         self.running = new_running
 
         # KV Connector: update state for finished KV Transfers.
@@ -955,6 +971,8 @@ class Scheduler(SchedulerInterface):
     def add_request(self, request: Request) -> None:
         self.waiting.add_request(request)
         self.requests[request.request_id] = request
+        if self.ucm_sparse:
+            self.ucm_sparse.request_begin(request.request_id, request.prompt_token_ids)
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
 
@@ -1004,6 +1022,8 @@ class Scheduler(SchedulerInterface):
 
     def _free_request(self, request: Request) -> Optional[dict[str, Any]]:
         assert request.is_finished()
+        if self.ucm_sparse:
+            self.ucm_sparse.request_finished_in_scheduler(request.request_id)
 
         delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
@@ -1154,7 +1174,6 @@ class Scheduler(SchedulerInterface):
         for req_id in (model_runner_output.finished_sending or ()):
             logger.debug("Finished sending KV transfer for request %s", req_id)
             self._free_blocks(self.requests[req_id])
-
 
     def _update_requests_with_invalid_blocks(
             self, requests: Iterable[Request],
