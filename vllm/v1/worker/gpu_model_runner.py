@@ -473,6 +473,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_data.resumed_from_preemption[i]
+            num_output_tokens = req_data.num_output_tokens[i]
 
             # Update the cached states.
             req_state.num_computed_tokens = num_computed_tokens
@@ -492,6 +493,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 elif num_new_tokens > 0:
                     req_state.output_token_ids.extend(
                         new_token_ids[-num_new_tokens:])
+            elif num_output_tokens < len(req_state.output_token_ids):
+                # Some output tokens were discarded due to a sync-KV-load
+                # failure. Align the cached state.
+                del req_state.output_token_ids[num_output_tokens:]
+
+                req_index = self.input_batch.req_id_to_index.get(req_id)
+                if req_index is not None:
+                    old_end_idx = self.input_batch.num_tokens_no_spec[
+                        req_index]
+                    end_idx = self.input_batch.num_prompt_tokens[
+                        req_index] + num_output_tokens
+                    self.input_batch.num_tokens[req_index] = end_idx
+                    self.input_batch.num_tokens_no_spec[req_index] = end_idx
+                    self.input_batch.is_token_ids[req_index,
+                                                end_idx:old_end_idx] = False
 
             # Update the block IDs.
             if not resumed_from_preemption:
@@ -1378,9 +1394,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 inputs_embeds=inputs_embeds,
             )
 
-            self.maybe_wait_for_kv_save()
+            finished_dumping = self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = (
                 self.get_finished_kv_transfers(scheduler_output))
+            invalid_block_ids = self.get_block_ids_with_load_errors()
 
         if self.use_aux_hidden_state_outputs:
             hidden_states, aux_hidden_states = model_output
@@ -1562,7 +1579,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             pooler_output=[],
             finished_sending=finished_sending,
             finished_recving=finished_recving,
+            finished_dumping=finished_dumping,
             num_nans_in_logits=num_nans_in_logits,
+            invalid_block_ids = invalid_block_ids
         )
 
     def propose_draft_token_ids(
@@ -1693,13 +1712,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.maybe_setup_kv_connector(scheduler_output)
             finished_sending, finished_recving = (
                 self.get_finished_kv_transfers(scheduler_output))
+            invalid_block_ids = self.get_block_ids_with_load_errors()
+            get_kv_transfer_group().clear_connector_metadata()
 
-        if not finished_sending and not finished_recving:
+        if not finished_sending and not finished_recving and not invalid_block_ids:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
         output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
         output.finished_sending = finished_sending
         output.finished_recving = finished_recving
+        output.invalid_block_ids = invalid_block_ids
         return output
 
     @staticmethod
@@ -1719,9 +1741,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_connector.start_load_kv(get_forward_context())
 
     @staticmethod
-    def maybe_wait_for_kv_save() -> None:
+    def maybe_wait_for_kv_save():
         if has_kv_transfer_group():
-            get_kv_transfer_group().wait_for_save()
+            return get_kv_transfer_group().wait_for_save()
 
     @staticmethod
     def get_finished_kv_transfers(
@@ -1731,6 +1753,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return get_kv_transfer_group().get_finished(
                 scheduler_output.finished_req_ids)
         return None, None
+
+    def get_block_ids_with_load_errors(self) -> Optional[set[int]]:
+        if has_kv_transfer_group():
+            return get_kv_transfer_group().get_block_ids_with_load_errors()
+        return None
 
     def propose_ngram_draft_token_ids(
         self,
