@@ -4,7 +4,7 @@
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import Literal, overload, Union
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
@@ -13,7 +13,7 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
-
+from vllm.v1.ucm_offload.state import get_ucm_offloader, INVALID_SLOT
 logger = init_logger(__name__)
 
 
@@ -230,6 +230,7 @@ class KVCacheManager:
         num_lookahead_tokens: int = 0,
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
+        num_slots_sparsed: Union[None, int] = None,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -268,7 +269,8 @@ class KVCacheManager:
         """
         if num_new_tokens == 0:
             raise ValueError("num_new_tokens must be greater than 0")
-
+        if num_slots_sparsed != INVALID_SLOT:
+            return get_ucm_offloader().allocate_slots(self, request, num_encoder_tokens, num_slots_sparsed)
         if new_computed_blocks is not None:
             new_computed_block_list = new_computed_blocks.blocks
         else:

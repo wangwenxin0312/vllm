@@ -153,6 +153,8 @@ from .utils import (
     scatter_mm_placeholders,
 )
 
+from vllm.v1.ucm_offload.state import init_ucm_offloader, get_ucm_offloader, INVALID_SLOT
+
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -700,13 +702,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # Update the states of the running/resumed requests.
         is_last_rank = get_pp_group().is_last_rank
         req_data = scheduler_output.scheduled_cached_reqs
+        req_sparsed_slots = scheduler_output.req_sparsed_slots
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_data.resumed_from_preemption[i]
             num_output_tokens = req_data.num_output_tokens[i]
-
+            is_sparsed_request = req_sparsed_slots[req_id] != INVALID_SLOT
             # Update the cached states.
 
             req_state.num_computed_tokens = num_computed_tokens
@@ -740,7 +743,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     self.input_batch.num_tokens_no_spec[req_index] = end_idx
 
             # Update the block IDs.
-            if not resumed_from_preemption:
+            if resumed_from_preemption or is_sparsed_request:
+                # The request is resumed from preemption.
+                # Replace the existing block IDs with the new ones.
+                req_state.block_ids = new_block_ids
+            elif not resumed_from_preemption:
                 if new_block_ids is not None:
                     # Append the new blocks to the existing block IDs.
                     for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
@@ -767,6 +774,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
+            if is_sparsed_request:
+                self.input_batch.block_table.reset_row(req_index)
             if new_block_ids is not None:
                 self.input_batch.block_table.append_row(new_block_ids, req_index)
 
@@ -1083,6 +1092,19 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             out=positions_np,
         )
 
+        self.seq_lens.np[:num_reqs] = (
+            self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
+        )
+        # TODO: improve performance, no `positions_np.copy()`
+        sparsed_positions = positions_np.copy()
+        req_sparsed_slots = scheduler_output.req_sparsed_slots
+        for req_id in self.input_batch.req_id_to_index:
+            is_sparsed_request = req_sparsed_slots[req_id] != INVALID_SLOT
+            req_index = self.input_batch.req_id_to_index[req_id]
+            offset = 0 if req_index == 0 else cu_num_tokens[req_index - 1] # TODO: support MTP
+            if is_sparsed_request:
+                sparsed_positions[offset] = req_sparsed_slots[req_id] - 1
+
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -1153,7 +1175,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
                 output_idx += num_sched
 
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
+        self.input_batch.block_table.compute_slot_mapping(req_indices, sparsed_positions)
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
         # Prepare the attention metadata.
@@ -1187,9 +1209,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_scheduled_tokens_per_request=num_scheduled_tokens,
         )
 
-        self.seq_lens.np[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
-        )
+        for req_id in self.input_batch.req_id_to_index:
+            req_index = self.input_batch.req_id_to_index[req_id]
+            is_sparsed_request = scheduler_output.req_sparsed_slots[req_id] != INVALID_SLOT
+            if is_sparsed_request:
+                self.seq_lens.np[req_index] = scheduler_output.req_sparsed_slots[req_id]
         # Fill unused with 0 for full cuda graph mode.
         self.seq_lens.np[num_reqs:].fill(0)
         self.seq_lens.copy_to_gpu()

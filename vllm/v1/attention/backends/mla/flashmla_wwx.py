@@ -5,7 +5,12 @@ from typing import TYPE_CHECKING, ClassVar, Optional
 
 import numpy as np
 import torch
-
+import os
+import tempfile
+from pathlib import Path
+import ucmdevice as uc
+import time
+import math
 from vllm import _custom_ops as ops
 from vllm.attention.backends.abstract import (
     AttentionBackend,
@@ -30,7 +35,6 @@ from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
-from vllm.v1.ucm_offload.state import get_ucm_offloader
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
@@ -49,6 +53,282 @@ structured as:
 -   **Last 128 bytes:** The "RoPE" part, containing 64 `bfloat16` values. This 
     part is not quantized for accuracy.
 """
+class KVOffloader:
+    def __init__(self, num_layers, block_size, token_dim_bytes, device_id):
+        self.num_layers = int(num_layers)
+        self.block_size = int(block_size)
+        self.token_dim_bytes = int(token_dim_bytes)  # 656
+        self.block_bytes = self.block_size * self.token_dim_bytes
+        self.dev = uc.MakeDevice(int(device_id))
+        _ = self.dev.Setup()
+
+        # ---- 统一 slab 相关 ----
+        self._slab_host: torch.Tensor | None = None           # Pinned Host 大块
+        self._base_host_ptr: int | None = None                # 基地址（uintp）
+        self._layer_offset_blocks: list[int] | None = None    # 每层块偏移（单位：block）
+        self._layer_capacity_blocks: list[int] | None = None  # 每层容量（单位：block）
+
+        # ---- 每层映射：global_block_id -> 在该层 slab 内的顺序位置（0..nblk-1）----
+        self._layer_block_ids: dict[int, torch.Tensor] = {}
+        self._layer_id2pos: dict[int, dict[int, int]] = {}
+
+    # 一次性在 prefill 第0层调用。支持 per_layer_num_actual_tokens 为 int（广播）或 list/ndarray
+    def prepare_unified_slab(self, per_layer_num_actual_tokens, out_token_reserve: int = 100):
+        # if isinstance(per_layer_num_actual_tokens, (int, np.integer)):
+        #     per_layer_num_actual_tokens = [int(per_layer_num_actual_tokens)] * self.num_layers
+        # else:
+        #     per_layer_num_actual_tokens = [int(x) for x in per_layer_num_actual_tokens]
+        #     assert len(per_layer_num_actual_tokens) == self.num_layers
+        per_layer_num_actual_tokens = [int(per_layer_num_actual_tokens)] * self.num_layers
+
+        # 计算每层需要的块数（按块向上取整）
+        per_layer_blocks = [
+            math.ceil((na + int(out_token_reserve)) / self.block_size)
+            for na in per_layer_num_actual_tokens
+        ]
+        self._layer_capacity_blocks = per_layer_blocks
+
+        # 前缀和得到每层块偏移（单位：block）
+        offsets = [0]
+        for b in per_layer_blocks[:-1]:
+            offsets.append(offsets[-1] + b)
+        self._layer_offset_blocks = offsets
+
+        total_blocks = sum(per_layer_blocks)
+        total_bytes = total_blocks * self.block_bytes
+
+        # 分配统一大 slab（Pinned Host）
+        self._slab_host = torch.empty(total_bytes, dtype=torch.uint8, pin_memory=True)
+        self._base_host_ptr = int(self._slab_host.data_ptr())
+
+        print(f"[Offloader] Unified slab allocated: {total_blocks} blocks "
+              f"({total_bytes/1e6:.2f} MB) for {self.num_layers} layers.")
+
+    def get_layer_base_ptr(self, lid: int) -> int:
+        base = self._base_host_ptr
+        ofs_blocks = self._layer_offset_blocks[lid]
+        return base + ofs_blocks * self.block_bytes
+
+    # ---- prefill：block 粒度 D2H（目的地使用统一 slab + 层内顺序位置）----
+    @torch.inference_mode()
+    def offload_blocks_prefill(self,
+                               lid: int,
+                               kv_cache_u8: torch.Tensor,          # [N_blk, 64, 656] uint8 (CUDA)
+                               block_table_cuda: torch.Tensor):    # CUDA，[num_reqs, max_blk] 或 [N]
+
+        # 提取要卸载的全局 block id（保持顺序，避免 unique 破坏“位置->id”的直觉）
+        if block_table_cuda.dim() == 2:
+            block_table_use = block_table_cuda.reshape(-1)
+        else:
+            block_table_use = block_table_cuda
+        block_table_use = block_table_use.to(torch.int64, non_blocking=True).contiguous()
+        block_table_use = block_table_use[block_table_use > 0]
+        nblk = int(block_table_use.numel())
+
+        # 保护：不能超过预留容量
+        cap = self._layer_capacity_blocks[lid]
+        if nblk > cap:
+            raise RuntimeError(f"[Offloader] L{lid}: required {nblk} blocks > reserved {cap}. "
+                               f"Increase out_token_reserve or capacity plan.")
+
+        # GPU 源 block 指针
+        dev_ptrs = torch.tensor(
+            [kv_cache_u8[int(g)].data_ptr() for g in block_table_use.tolist()],
+            dtype=torch.uint64, device="cuda"
+        )
+
+        # Host 目的地址：层基址 + 层内顺序 [0..nblk-1]
+        base = self.get_layer_base_ptr(lid)
+        slab_idx = torch.arange(nblk, dtype=torch.int64, device="cuda")
+        host_ptrs = (base + slab_idx * self.block_bytes).to(torch.uint64)
+
+        torch.cuda.synchronize(); t0 = time.perf_counter()
+        self.dev.D2HBatchSync(int(dev_ptrs.data_ptr()),
+                              int(host_ptrs.data_ptr()),
+                              int(nblk),
+                              int(self.block_bytes))
+        torch.cuda.synchronize(); t1 = time.perf_counter()
+        bw = (nblk * self.block_bytes) / (t1 - t0) / (1024**3)
+        print(f"[D2H][prefill][L{lid}] nblk={nblk}, {1000*(t1-t0):.3f} ms, {bw:.2f} GiB/s")
+
+        # 保存映射：global_block_id -> 层内顺序位置
+        self._layer_block_ids[lid] = block_table_use
+        self._layer_id2pos[lid] = {int(g): i for i, g in enumerate(block_table_use.tolist())}
+
+    # ---- decode：从 Host 精确取 tokens，拼成紧致 new_kvcache（供 kernel 直接吃）----
+    @torch.inference_mode()
+    def reload_tokens_decode(self, lid: int, topk_indices_global: torch.Tensor):
+        if topk_indices_global.dim() == 2:
+            topk_indices_global = topk_indices_global.squeeze(0)
+        tok_g = topk_indices_global.to(torch.long, non_blocking=True)
+
+        id2pos = self._layer_id2pos.get(lid, None)
+        if id2pos is None:
+            raise RuntimeError(f"[Offloader] L{lid} has no offloaded blocks; prefill offload first.")
+
+        bs = self.block_size
+        tok_blk = (tok_g // bs).to("cpu", non_blocking=True).numpy()
+        tok_ofs = (tok_g %  bs).to("cpu", non_blocking=True).numpy()
+
+        slab_idx = np.fromiter((id2pos.get(int(g), -1) for g in tok_blk),
+                               dtype=np.int64, count=tok_blk.size)
+        if (slab_idx < 0).any():
+            bad = int((slab_idx < 0).sum())
+            raise RuntimeError(f"[Offloader] L{lid}: {bad} tokens refer to non-offloaded blocks")
+
+        base = self.get_layer_base_ptr(lid)
+        host_token_addrs = base + slab_idx * self.block_bytes + tok_ofs * self.token_dim_bytes
+        host_token_dev = torch.from_numpy(host_token_addrs.view(np.uint64)).to("cuda", non_blocking=True)
+
+        ntok = int(tok_g.numel())
+        nblk = (ntok + bs - 1) // bs
+        new_kvcache = torch.empty((nblk, bs, self.token_dim_bytes), dtype=torch.uint8, device="cuda")
+
+        # 目标 token 顺序：紧致 [0..nblk*bs)
+        dst_blk = np.repeat(np.arange(nblk, dtype=np.int64), bs)[:ntok]
+        dst_ofs = np.tile(np.arange(bs, dtype=np.int64), nblk)[:ntok]
+        dst_base = np.array([new_kvcache[b].data_ptr() for b in range(nblk)], dtype=np.uintp)
+        dst_addrs = (dst_base[dst_blk] + dst_ofs * self.token_dim_bytes).astype(np.uintp)
+        dst_dev = torch.from_numpy(dst_addrs.view(np.uint64)).to("cuda", non_blocking=True)
+
+        torch.cuda.synchronize(); t0 = time.perf_counter()
+        self.dev.H2DBatchSync(int(dst_dev.data_ptr()),
+                              int(host_token_dev.data_ptr()),
+                              int(ntok),
+                              int(self.token_dim_bytes))
+        torch.cuda.synchronize(); t1 = time.perf_counter()
+        bw = (ntok * self.token_dim_bytes) / (t1 - t0) / (1024**3)
+        print(f"[H2D][decode-tight][L{lid}] ntok={ntok}, {1000*(t1-t0):.3f} ms, {bw:.2f} GiB/s")
+
+        k_view = new_kvcache.view(torch.uint8).unsqueeze(-2)
+        compact_bt = torch.arange(nblk, dtype=torch.int32, device="cuda")
+        return k_view, compact_bt
+
+    # ---- decode：把所需 token 直接回填到“新分配的 device blocks”（按给定 blocks 顺序紧密铺放）----
+    @torch.inference_mode()
+    def reload_tokens_decode_into_blocks(self,
+                                         lid: int,
+                                         topk_indices_global: torch.Tensor,  # CUDA int32/64 [N] or [1,N]
+                                         kv_cache_u8: torch.Tensor,          # [N_blk, 64, 656] (CUDA uint8)
+                                         dst_blocks_1d: torch.Tensor):        # CUDA int32/64 [B] 新分配的块ID
+        if topk_indices_global.dim() == 2:
+            topk_indices_global = topk_indices_global.squeeze(0)
+        tok_g = topk_indices_global.to(torch.long, non_blocking=True)
+
+        id2pos = self._layer_id2pos.get(lid, None)
+        if id2pos is None:
+            raise RuntimeError(f"[Offloader] L{lid} has no offloaded blocks; prefill offload first.")
+
+        bs = self.block_size
+        tok_blk = (tok_g // bs).to("cpu", non_blocking=True).numpy()
+        tok_ofs = (tok_g %  bs).to("cpu", non_blocking=True).numpy()
+        slab_idx = np.fromiter((id2pos.get(int(g), -1) for g in tok_blk),
+                               dtype=np.int64, count=tok_blk.size)
+        if (slab_idx < 0).any():
+            bad = int((slab_idx < 0).sum())
+            raise RuntimeError(f"[Offloader] L{lid}: {bad} tokens refer to non-offloaded blocks")
+
+        base = self.get_layer_base_ptr(lid)
+        host_token_addrs = base + slab_idx * self.block_bytes + tok_ofs * self.token_dim_bytes
+        host_dev = torch.from_numpy(host_token_addrs.view(np.uint64)).to("cuda", non_blocking=True)
+
+        ntok = int(tok_g.numel())
+        nblk_needed = (ntok + bs - 1) // bs
+        assert int(dst_blocks_1d.numel()) >= nblk_needed, \
+            f"dst_blocks ({int(dst_blocks_1d.numel())}) < needed ({nblk_needed})"
+
+        # 目的地址：按 dst_blocks 的顺序紧密铺放 tokens
+        dst_blocks = dst_blocks_1d.to(torch.long, non_blocking=True)[:nblk_needed]
+        # 每个 block 的基址
+        dst_base_ptrs = np.array([kv_cache_u8[int(b)].data_ptr() for b in dst_blocks.tolist()],
+                                 dtype=np.uintp)
+        # 每个 token 的目的地址
+        dst_blk = np.repeat(np.arange(nblk_needed, dtype=np.int64), bs)[:ntok]
+        dst_ofs = np.tile(np.arange(bs, dtype=np.int64), nblk_needed)[:ntok]
+        dst_addrs = (dst_base_ptrs[dst_blk] + dst_ofs * self.token_dim_bytes).astype(np.uintp)
+        dst_dev = torch.from_numpy(dst_addrs.view(np.uint64)).to("cuda", non_blocking=True)
+
+        torch.cuda.synchronize(); t0 = time.perf_counter()
+        self.dev.H2DBatchSync(int(dst_dev.data_ptr()),
+                              int(host_dev.data_ptr()),
+                              int(ntok),
+                              int(self.token_dim_bytes))
+        torch.cuda.synchronize(); t1 = time.perf_counter()
+        bw = (ntok * self.token_dim_bytes) / (t1 - t0) / (1024**3)
+        print(f"[H2D][decode-into-newblocks][L{lid}] ntok={ntok}, {1000*(t1-t0):.3f} ms, {bw:.2f} GiB/s")
+
+        # 返回用于 kernel 的 block_table（按我们铺放顺序就是  dst_blocks ）
+        return dst_blocks.to(dtype=torch.int32, device="cuda")
+
+    # ---- decode：新增 token 的 D2H（token 粒度） ----
+        # ---- decode：新增 token 的 D2H（token 粒度，写入统一 Host slab）----
+    @torch.inference_mode()
+    def dump_new_tokens_decode(self,
+                               lid: int,
+                               kv_cache_u8: torch.Tensor,            # [N_blk, block_size, token_dim_bytes] (CUDA uint8)
+                               new_token_global_ids_1d: torch.Tensor # CUDA int32/64 [N_new]
+                               ) -> None:
+        """
+        将 decode 阶段新产生的 tokens（global token ids）从 GPU 的 kv_cache_u8
+        逐 token 回写到 Host 统一 slab 本层对应区域中。
+        仅对“已在本层 offload 过的 blocks”执行写回；未 offload 的 blocks 会被跳过。
+
+        参数：
+          - lid: 当前层 id
+          - kv_cache_u8: 形状 [N_blk, block_size, token_dim_bytes] 的 CUDA uint8 张量
+          - new_token_global_ids_1d: 当前 step 新产生 token 的全局 token id（一维 CUDA 张量）
+        """
+        if new_token_global_ids_1d is None or int(new_token_global_ids_1d.numel()) == 0:
+            return
+
+        # 必须先完成：prepare_unified_slab() + 该层的 offload_blocks_prefill()
+        if lid not in self._layer_id2pos:
+            # 该层尚未建立 “global_block_id -> slab顺序位置” 映射，直接返回即可
+            return
+
+        self._check_ready()
+        id2pos = self._layer_id2pos[lid]
+        bs = self.block_size
+
+        # 1) 计算新 token 的全局 block id 与块内偏移
+        tok_g = new_token_global_ids_1d.to(torch.long, non_blocking=True)
+        tok_blk = (tok_g // bs).to("cpu", non_blocking=True).numpy()  # np.int64
+        tok_ofs = (tok_g %  bs).to("cpu", non_blocking=True).numpy()  # np.int64
+
+        # 2) 查询这些 block 是否已在 Host slab 映射（仅回写已 offload 的）
+        slab_idx = np.fromiter((id2pos.get(int(g), -1) for g in tok_blk),
+                               dtype=np.int64, count=tok_blk.size)
+        mask = slab_idx >= 0
+        if not mask.any():
+            return
+
+        tok_blk = tok_blk[mask]
+        tok_ofs = tok_ofs[mask]
+        slab_idx = slab_idx[mask]
+
+        # 3) 组装 GPU 源 token 地址（逐 token）
+        #    kv_cache_u8 形状 [N_blk, bs, token_dim_bytes]，第 b 块第 ofs 个 token 的首地址：
+        #    kv_cache_u8[b, ofs].data_ptr()
+        dev_addrs = np.empty(tok_blk.shape[0], dtype=np.uintp)
+        for i, (b, ofs) in enumerate(zip(tok_blk, tok_ofs)):
+            dev_addrs[i] = kv_cache_u8[int(b), int(ofs)].data_ptr()
+        dev_dev = torch.from_numpy(dev_addrs.view(np.uint64)).to("cuda", non_blocking=True)
+
+        # 4) 计算 Host 目的 token 地址：层基址 + 层内块顺序 * block_bytes + 块内偏移 * token_dim_bytes
+        base = self.get_layer_base_ptr(lid)
+        host_addrs = base + slab_idx * self.block_bytes + tok_ofs * self.token_dim_bytes
+        host_dev = torch.from_numpy(host_addrs.view(np.uint64)).to("cuda", non_blocking=True)
+
+        # 5) 执行批量 D2H（按“token 粒度”）
+        ntok = int(host_addrs.size)
+        torch.cuda.synchronize(); t0 = time.perf_counter()
+        self.dev.D2HBatchSync(int(dev_dev.data_ptr()),
+                              int(host_dev.data_ptr()),
+                              int(ntok),
+                              int(self.token_dim_bytes))
+        torch.cuda.synchronize(); t1 = time.perf_counter()
+        bw = (ntok * self.token_dim_bytes) / (t1 - t0) / (1024**3)
+        print(f"[D2H][decode-new][L{lid}] ntok={ntok}, {1000*(t1-t0):.3f} ms, {bw:.2f} GiB/s")
 
 
 class FlashMLASparseBackend(AttentionBackend):
@@ -402,7 +682,7 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
         assert indexer is not None
         self.topk_indices_buffer = indexer.topk_indices_buffer
         self.padding = 128 if current_platform.is_device_capability(100) else 64
-        self.ucm_offloader = get_ucm_offloader()
+        self.kv_offloader = KVOffloader(num_layers=61, block_size=64, token_dim_bytes=656, device_id=0)
         self.step = 0
 
     def _forward_bf16_kv(
@@ -436,6 +716,8 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
         output = output[:, : self.num_heads, :]
         return output
 
+
+
     def _forward_fp8_kv_sparse(
         self,
         q: torch.Tensor,
@@ -445,23 +727,21 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
     ) -> torch.Tensor:
         assert attn_metadata.fp8_extra_metadata is not None
         extra_metadata = attn_metadata.fp8_extra_metadata
+
+        # todo1:需要归还block吗？
+        k_view, compact_bt = self.kv_offloader.reload_tokens_decode(self.layer_id, topk_indices)
+
         
-        # todo: check extra_metadata 里的block_table
-        self.ucm_offloader.reload_tokens_decode_into_blocks(
-            lid=self.layer_id,
-            topk_indices_global=topk_indices,
-            kv_cache_u8=kv_c_and_k_pe_cache.view(-1, 64, 656),
-            dst_blocks_1d=attn_metadata.block_table,
-        )
-        # todo: 替换为之前的attention算子 更新block_table
+        # todo: 替换为之前的attention算子 更新block_table?
         _attn_out, _ = flash_mla_with_kvcache(
             q=q.unsqueeze(0),  # unsqueeze to add batch_dim
-            k_cache=kv_c_and_k_pe_cache.view(torch.uint8).unsqueeze(-2),
-            block_table=attn_metadata.block_table,
+            k_cache=k_view.view(torch.uint8).unsqueeze(-2),
+            block_table=compact_bt,
             head_dim_v=512,
             cache_seqlens=extra_metadata.cache_lens,
             tile_scheduler_metadata=extra_metadata.scheduler_metadata,
             num_splits=extra_metadata.num_splits,
+            is_fp8_kvcache=True,
             indices=None,  # unsqueeze to add batch_dim
             softmax_scale=self.softmax_scale,
         )
@@ -478,13 +758,6 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
         assert attn_metadata.fp8_extra_metadata is not None
         extra_metadata = attn_metadata.fp8_extra_metadata
 
-        if self.layer_id == 0:
-            # 统一容量规划：可用 num_actual_toks 作为“每层相同”的近似；若有各层真实值可传列表
-            self.ucm_offloader.prepare_unified_slab(
-                per_layer_num_actual_tokens=int(attn_metadata.num_actual_tokens),
-                out_token_reserve=100,
-            )
-
         _attn_out, _ = flash_mla_with_kvcache(
             q=q.unsqueeze(0),  # unsqueeze to add batch_dim
             k_cache=kv_c_and_k_pe_cache.view(torch.uint8).unsqueeze(-2),
@@ -497,10 +770,21 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
             indices=topk_indices.unsqueeze(0),  # unsqueeze to add batch_dim
             softmax_scale=self.softmax_scale,
         )
-        self.ucm_offloader.offload_blocks_prefill(
+
+        # save kvcache to Host
+        if self.layer_id == 0:
+            # 统一容量规划：可用 num_actual_toks 作为“每层相同”的近似；若有各层真实值可传列表
+            self.kv_offloader.prepare_unified_slab(
+                per_layer_num_actual_tokens=int(attn_metadata.num_actual_tokens),
+                out_token_reserve=100,
+            )
+
+        self.kv_offloader.offload_blocks_prefill(
             lid=self.layer_id,
             kv_cache_u8=kv_c_and_k_pe_cache.view(-1, 64, 656),
             block_table_cuda=attn_metadata.block_table,
+            num_actual_tokens=int(attn_metadata.num_actual_tokens),
+            out_token_reserve=100,
         )
 
         return _attn_out
@@ -534,8 +818,11 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
             return output.fill_(0)
 
         num_actual_toks = attn_metadata.num_actual_tokens
+        
         if num_actual_toks == 1:
             self.step += 1
+            # print(f"[DEBUG] step={self.step:<4} | layer={layer.layer_name:<20} | num_actual_toks={num_actual_toks}")
+
         # Inputs and outputs may be padded for CUDA graphs
 
         q = q[:num_actual_toks, ...]
@@ -586,11 +873,12 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
                     q, kv_cache, topk_indices_global, attn_metadata
                 )
                 new_tok_ids = attn_metadata.slot_mapping.flatten()[:num_actual_toks].to(torch.long)
-                self.ucm_offloader.dump_new_tokens_decode(
+                self.kv_offloader.dump_new_tokens_decode(
                     lid=self.layer_id,
                     kv_cache_u8=kv_cache.view(-1, 64, 656),
                     new_token_global_ids_1d=new_tok_ids,
                 )
+                # dump_attn_tensors_by_step(self.step, layer.layer_name, q, kv_cache, topk_indices_global, attn_metadata.block_table, "/home/externals/wangwenxin21/DSA/decode_results_1")
             else:
                 # prefill 阶段
                 attn_out = self._forward_fp8_kv(
