@@ -41,6 +41,7 @@ from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import WorkerBase
+from vllm.v1.ucm_offload.state import ensure_ucm_offloader_initialized, UcmSparseRole
 
 logger = init_logger(__name__)
 
@@ -780,3 +781,4 @@ def init_worker_distributed_environment(
     )
 
     ensure_kv_transfer_initialized(vllm_config)
+    ensure_ucm_offloader_initialized(vllm_config, role=UcmSparseRole.WORKER, device_id=local_rank)

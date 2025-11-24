@@ -117,6 +117,11 @@ def test_sparse_flashmla_prefill_smoke():
     indices = torch.zeros((s_q, h_kv, topk), dtype=torch.int32, device=device)
 
     out, max_logits, lse = fm.flash_mla_sparse_prefill(q, kv, indices, 1.0, d_v)
+    print("====out", out.shape)
     assert out.shape == (s_q, h_q, d_v)
     assert max_logits.shape == (s_q, h_q)
     assert lse.shape == (s_q, h_q)
+
+test_sparse_flashmla_prefill_smoke()
+test_sparse_flashmla_decode_smoke()
+test_sparse_flashmla_metadata_smoke()

@@ -33,6 +33,7 @@ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.ucm_offload.state import ensure_ucm_offloader_initialized, INVALID_SLOT, UcmSparseRole
 
 if TYPE_CHECKING:
     import numpy as np
@@ -83,6 +84,8 @@ class Scheduler(SchedulerInterface):
         # Create KVConnector for the Scheduler. Note that each Worker
         # will have a corresponding KVConnector with Role=WORKER.
         # KV Connector pushes/pull of remote KVs for P/D and offloading.
+        self.ucm_offloader = ensure_ucm_offloader_initialized(self.vllm_config, role=UcmSparseRole.SCHEDULER)
+        print("self.ucm_offloader", self.ucm_offloader)
         self.connector = None
         if self.vllm_config.kv_transfer_config is not None:
             assert len(self.kv_cache_config.kv_cache_groups) == 1, (
@@ -204,9 +207,14 @@ class Scheduler(SchedulerInterface):
 
         # First, schedule the RUNNING requests.
         req_index = 0
+        req_sparsed_slots: dict[str, int] = {}
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
-
+            num_slots_sparsed = INVALID_SLOT
+            if self.ucm_offloader:
+                num_slots_sparsed = self.ucm_offloader.estimate_num_slots_sparsed(request)
+                # print("===num_slots_new==", num_slots_sparsed)
+            req_sparsed_slots.update({request.request_id: num_slots_sparsed})
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
@@ -259,6 +267,7 @@ class Scheduler(SchedulerInterface):
                     request,
                     num_new_tokens,
                     num_lookahead_tokens=self.num_lookahead_tokens,
+                    num_slots_sparsed=num_slots_sparsed,
                 )
 
                 if new_blocks is not None:
@@ -351,7 +360,11 @@ class Scheduler(SchedulerInterface):
                     break
 
                 request = self.waiting.peek_request()
-
+                num_slots_sparsed = INVALID_SLOT
+                if self.ucm_offloader:
+                    num_slots_sparsed = self.ucm_offloader.estimate_num_slots_sparsed(request)
+                #     print("===num_slots_new==", num_slots_sparsed)
+                req_sparsed_slots.update({request.request_id: num_slots_sparsed})
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                     is_ready = self._update_waiting_for_remote_kv(request)
@@ -509,6 +522,7 @@ class Scheduler(SchedulerInterface):
                     num_lookahead_tokens=effective_lookahead_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
+                    num_slots_sparsed=num_slots_sparsed,
                 )
 
                 if new_blocks is None:
@@ -623,6 +637,7 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
+            req_sparsed_slots=req_sparsed_slots,
             # finished_req_ids is an existing state in the scheduler,
             # instead of being newly scheduled in this step.
             # It contains the request IDs that are finished in between
