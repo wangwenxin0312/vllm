@@ -451,7 +451,7 @@ def unified_attention_with_output(
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
     if not self.use_mla:
-        maybe_execute_sparse_attention_begin(
+        query, key, value, _ = maybe_execute_sparse_attention_begin(
             query, key, value, layer_name, forward_context, output
         )
     self.impl.forward(self,
@@ -495,18 +495,21 @@ def maybe_execute_sparse_attention_begin(
         value: torch.Tensor,
         layer_name: str,
         forward_context: ForwardContext,
+        output: Optional[torch.Tensor] = None,
         phase: Optional[str] = None,
 ):
     if not has_ucm_sparse():
-        return
+            return query, key, value, output
 
     ucm_sparse = get_ucm_sparse()
 
     attn_metadata = forward_context.attn_metadata
     if attn_metadata is None:
-        return
+        return query, key, value, output
 
-    ucm_sparse.attention_begin(query, key, value, layer_name, forward_context, phase)
+    return ucm_sparse.attention_begin(
+        query, key, value, layer_name, forward_context, output, phase
+    )
 
 def maybe_execute_sparse_attention_finished(
         query: torch.Tensor,

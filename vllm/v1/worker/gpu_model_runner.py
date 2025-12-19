@@ -1405,7 +1405,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
             self.maybe_wait_for_kv_save()
-            self.maybe_execute_ucm_sparse_finished()
+            logits_indices = self.maybe_execute_ucm_sparse_finished(logits_indices)
 
             finished_sending, finished_recving = (
                 self.get_finished_kv_transfers(scheduler_output))
@@ -1754,15 +1754,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def maybe_execute_ucm_sparse_begin(self, scheduler_output: "SchedulerOutput", attn_metadata: CommonAttentionMetadata):
         if not has_ucm_sparse():
             return
+        if has_kv_transfer_group():
+            uc_connector = get_kv_transfer_group()
+            uc_setup_model = getattr(uc_connector, "setup_model", None)
+            if callable(uc_setup_model):
+                uc_setup_model(self.model)
         ucm_sparse = get_ucm_sparse()
         ucm_sparse.build_sparse_meta(scheduler_output, self.requests, self.input_batch, attn_metadata)
         ucm_sparse.execute_begin(scheduler_output)
 
-    def maybe_execute_ucm_sparse_finished(self):
+    def maybe_execute_ucm_sparse_finished(self, logits_indices):
         if not has_ucm_sparse():
-            return
+            return logits_indices
         ucm_sparse = get_ucm_sparse()
-        ucm_sparse.execute_finished()
+        return ucm_sparse.execute_finished(logits_indices)
 
     def ucm_sparse_request_finished_in_worker(self, request_id: str | int):
         if not has_ucm_sparse():

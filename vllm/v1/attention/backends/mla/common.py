@@ -959,7 +959,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             )
 
         if has_prefill:
-            maybe_execute_sparse_attention_begin(prefill_q, prefill_k_c_normed, prefill_k_pe, layer.layer_name, forward_context, "prefill")
+            prefill_q, prefill_k_c_normed, prefill_k_pe, _ = maybe_execute_sparse_attention_begin(prefill_q, prefill_k_c_normed, prefill_k_pe, layer.layer_name, forward_context, phase="prefill")
             output[num_decode_tokens:] = self._forward_prefill(
                 prefill_q, prefill_k_c_normed, prefill_k_pe, kv_cache,
                 attn_metadata)
@@ -974,7 +974,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             decode_ql_nope = torch.bmm(decode_q_nope, self.W_UK_T)
             # Convert from (N, B, L) to (B, N, L)
             decode_ql_nope = decode_ql_nope.transpose(0, 1)
-            maybe_execute_sparse_attention_begin(torch.cat([decode_ql_nope, decode_q_pe],dim=-1), decode_ql_nope, decode_q_pe, layer.layer_name, forward_context, "decode")
+            _, decode_ql_nope, decode_q_pe, _ = maybe_execute_sparse_attention_begin(torch.cat([decode_ql_nope, decode_q_pe],dim=-1), decode_ql_nope, decode_q_pe, layer.layer_name, forward_context, phase="decode")
             output[:num_decode_tokens] = self._forward_decode(
                 decode_ql_nope, decode_q_pe, kv_cache, attn_metadata)
             maybe_execute_sparse_attention_finished(torch.cat([decode_ql_nope, decode_q_pe],dim=-1), decode_ql_nope, decode_q_pe, output[:num_decode_tokens], layer.layer_name, forward_context, "decode")
