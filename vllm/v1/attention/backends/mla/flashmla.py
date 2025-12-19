@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar, Optional
 
 import torch
-
+import vllm.envs as envs
 from vllm.attention.backends.abstract import (AttentionType,
                                               is_quantized_kv_cache)
 from vllm.attention.ops.flashmla import (flash_mla_with_kvcache,
@@ -46,6 +46,10 @@ class FlashMLABackend(MLACommonBackend):
 class FlashMLADecodeMetadata(MLACommonDecodeMetadata):
     tile_scheduler_metadata: torch.Tensor
     num_splits: torch.Tensor
+    topk_seq_lens: torch.Tensor
+    topk_tile_scheduler_metadata: torch.Tensor
+    topk_num_splits: torch.Tensor
+    topk_block_table: torch.Tensor = None
 
 
 @dataclass
@@ -62,9 +66,24 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
 
         self.num_q_heads = self.runner.model_config.get_num_attention_heads(
             self.runner.parallel_config)
-
+        self.mla_block_size = self.runner.vllm_config.cache_config.block_size
         self.cg_buf_tile_scheduler_metadata = None
         self.cg_buf_num_splits = None
+
+        self.device = self.runner.device
+        device_properties = torch.cuda.get_device_properties(self.device)
+        num_sms = device_properties.multi_processor_count
+        if envs.VLLM_HASH_ATTENTION:
+                self.cg_buf_topk_tile_scheduler_metadata = torch.zeros(
+                    (num_sms, 8),
+                    device=self.device,
+                    dtype=torch.int32,
+                )
+                self.cg_buf_topk_num_splits = torch.empty(
+                    (self.runner.scheduler_config.max_num_seqs + 1),
+                    device=self.device,
+                    dtype=torch.int32
+                )
 
     def _build_decode(self, block_table_tensor: torch.Tensor,
                       seq_lens: torch.Tensor) -> FlashMLADecodeMetadata:
@@ -74,6 +93,23 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
             self.num_q_heads,
             1, # MQA for the decode path
         )
+        if envs.VLLM_HASH_ATTENTION:
+            from ucm.sparse.kvcomp.hamming_topk import update_seq_lens
+            topk_seq_lens = update_seq_lens(
+                seq_lens,
+                topk_token=envs.VLLM_HASH_ATTENTION_TOPK,
+                block_size=self.mla_block_size,
+            )
+            topk_tile_scheduler_metadata, topk_num_splits = \
+                get_mla_metadata(
+                topk_seq_lens,
+                self.num_q_heads,
+                1,
+            )
+        else:
+            topk_seq_lens = None
+            topk_tile_scheduler_metadata = None 
+            topk_num_splits = None
 
         if self.runner.full_cuda_graph:
             # First time around (CUDAGraph capture), allocate the static buffer
@@ -98,12 +134,27 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
                 num_splits_view.copy_(num_splits)
                 self.cg_buf_num_splits[n:].fill_(0)  # fill the rest with 0s
                 num_splits = num_splits_view
+                
+                sm_parts = tile_scheduler_metadata.size(0)
+                if envs.VLLM_HASH_ATTENTION:
+                    topk_tile_scheduler_metadata_view = \
+                        self.cg_buf_topk_tile_scheduler_metadata[:sm_parts]
+                    topk_tile_scheduler_metadata_view.copy_(topk_tile_scheduler_metadata)
+                    topk_tile_scheduler_metadata = topk_tile_scheduler_metadata_view
+
+                    topk_num_splits_view = self.cg_buf_topk_num_splits[:n]
+                    topk_num_splits_view.copy_(topk_num_splits)
+                    self.cg_buf_topk_num_splits[n:].fill_(topk_num_splits[-1])
+                    topk_num_splits = topk_num_splits_view
 
         return FlashMLADecodeMetadata(
             block_table=block_table_tensor,
             seq_lens=seq_lens,
             tile_scheduler_metadata=tile_scheduler_metadata,
             num_splits=num_splits,
+            topk_seq_lens=topk_seq_lens,
+            topk_tile_scheduler_metadata=topk_tile_scheduler_metadata,
+            topk_num_splits=topk_num_splits,
         )
 
 

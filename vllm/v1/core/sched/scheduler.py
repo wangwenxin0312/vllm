@@ -405,10 +405,10 @@ class Scheduler(SchedulerInterface):
                             request)
 
                     # Get externally-cached tokens if using a KVConnector.
-                    if self.connector is not None:
-                        num_external_computed_tokens, load_kv_async = (
-                            self.connector.get_num_new_matched_tokens(
-                                request, num_new_local_computed_tokens))
+                    # if self.connector is not None:
+                    #     num_external_computed_tokens, load_kv_async = (
+                    #         self.connector.get_num_new_matched_tokens(
+                    #             request, num_new_local_computed_tokens))
 
                     # Total computed tokens (local + external).
                     num_computed_tokens = (num_new_local_computed_tokens +

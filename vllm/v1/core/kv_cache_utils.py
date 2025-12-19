@@ -16,7 +16,7 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheTensor, SlidingWindowSpec)
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
-
+import vllm.envs as envs
 logger = init_logger(__name__)
 
 
@@ -692,6 +692,19 @@ def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
     page_size = get_uniform_page_size(kv_cache_spec)
     num_blocks = get_num_blocks(vllm_config, len(kv_cache_spec),
                                 available_memory, page_size)
+
+    if envs.VLLM_HASH_ATTENTION:
+        from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
+
+        if vllm_config.cache_config.cache_dtype == 'auto':
+            dtype = vllm_config.model_config.dtype
+        else:
+            dtype = STR_DTYPE_TO_TORCH_DTYPE[vllm_config.cache_config.cache_dtype]
+        khash_scale = dtype.itemsize * 8
+        new_num_blocks = num_blocks * khash_scale // (khash_scale + 1)
+        logger.info("[HASH_ATTN] reduce num_blocks from %d to %d to allocate khash_cache",
+                    num_blocks, new_num_blocks)
+        num_blocks = new_num_blocks
 
     per_layer_size = page_size * num_blocks
     # All layers have the same KV cache spec, so we create one kv cache group
