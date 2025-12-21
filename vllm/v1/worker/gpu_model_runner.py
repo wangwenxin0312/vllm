@@ -2622,6 +2622,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         kv_caches = self._reshape_kv_cache_tensors(kv_cache_config,
                                                    kv_cache_raw_tensors)
 
+        if has_ucm_sparse():
+            ucm_sparse = get_ucm_sparse()
+            if envs.VLLM_HASH_ATTENTION:
+                ucm_sparse.initialize_kv_hash_cache_tensors(kv_caches, self.device)
+
         # Setup `kv_cache_config` and `kv_caches` for models
         # with cross-layer KV sharing
         if self.shared_kv_cache_layers:

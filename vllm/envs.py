@@ -7,6 +7,23 @@ import sys
 import tempfile
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+# VLLM_HASH_ATTENTION: bool = False
+VLLM_HASH_ATTENTION_TOPK: int = 2048
+VLLM_HASH_ATTENTION_REDUCTION_HEAD_NUM: int = 2
+VLLM_HASH_ATTENTION_ROLLBACK_LAYERS: list[int] = [0, 1, 2, 3, 4, 5]
+VLLM_HASH_ATTENTION_SKIP_LAYERS: list[bool] = [
+    False, False, False, False, False, False,
+    False, True, False, False, True, True,
+    False, True, False, False, False, False,
+    False, False, False, False, True, True,
+    False, False, False, True, True, True,
+    True, True, True, True, False, True,
+    True, True, True, True, True, True,
+    True, True, True, True, True, True,
+    True, False, True, True, True, True,
+    True, True, True, True, True, True, True
+]
+
 if TYPE_CHECKING:
     VLLM_HOST_IP: str = ""
     VLLM_PORT: Optional[int] = None
@@ -953,7 +970,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # generations on machines < 100 for compressed-tensors
     # models
     "VLLM_USE_NVFP4_CT_EMULATIONS":
-    lambda: bool(int(os.getenv("VLLM_USE_NVFP4_CT_EMULATIONS", "0")))
+    lambda: bool(int(os.getenv("VLLM_USE_NVFP4_CT_EMULATIONS", "0"))),
+    
+    "VLLM_HASH_ATTENTION":
+    lambda: bool(int(os.getenv("VLLM_HASH_ATTENTION", "0"))),
+
+    "VLLM_HASH_ATTENTION_TOPK":
+    lambda: int(os.getenv("VLLM_HASH_ATTENTION_TOPK", "2048")),
+
+    "VLLM_HASH_ATTENTION_REDUCTION_HEAD_NUM":
+    lambda: int(os.getenv("VLLM_HASH_ATTENTION_REDUCTION_HEAD_NUM", "2")),
+
+    "VLLM_HASH_ATTENTION_ROLLBACK_LAYERS":
+    lambda: VLLM_HASH_ATTENTION_ROLLBACK_LAYERS if "VLLM_HASH_ATTENTION_ROLLBACK_LAYERS" not in os.environ else \
+        [int(x.strip()) for x in os.environ["VLLM_HASH_ATTENTION_ROLLBACK_LAYERS"].split(",")],
+
+    "VLLM_HASH_ATTENTION_SKIP_LAYERS":
+    lambda: VLLM_HASH_ATTENTION_SKIP_LAYERS if "VLLM_HASH_ATTENTION_SKIP_LAYERS" not in os.environ else \
+        [x.strip().lower() == "true" for x in os.environ["VLLM_HASH_ATTENTION_SKIP_LAYERS"].split(",")],
 }
 
 # --8<-- [end:env-vars-definition]

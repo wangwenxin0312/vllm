@@ -497,6 +497,10 @@ def maybe_execute_sparse_attention_begin(
         forward_context: ForwardContext,
         output: Optional[torch.Tensor] = None,
         phase: Optional[str] = None,
+        k_hash: Optional[torch.Tensor] = None,
+        k_scale: Optional[torch.Tensor] = None,
+        decode_ql_nope: Optional[torch.Tensor] = None,
+        decode_q_pe: Optional[torch.Tensor] = None,
 ):
     if not has_ucm_sparse():
             return query, key, value, output
@@ -508,7 +512,7 @@ def maybe_execute_sparse_attention_begin(
         return query, key, value, output
 
     return ucm_sparse.attention_begin(
-        query, key, value, layer_name, forward_context, output, phase
+        query, key, value, layer_name, forward_context, output, phase, k_hash, k_scale, decode_ql_nope, decode_q_pe
     )
 
 def maybe_execute_sparse_attention_finished(
