@@ -15,6 +15,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 import vllm.envs as envs
+import os
 from vllm.attention import AttentionType, get_attn_backend
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.attention.layer import Attention
@@ -2621,6 +2622,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Change the memory buffer to the desired shape
         kv_caches = self._reshape_kv_cache_tensors(kv_cache_config,
                                                    kv_cache_raw_tensors)
+
+        if has_ucm_sparse():
+            ucm_sparse = get_ucm_sparse()
+            if os.environ["VLLM_HASH_ATTENTION"] == "1":
+                ucm_sparse.initialize_kv_hash_cache_tensors(kv_caches, self.device)
 
         # Setup `kv_cache_config` and `kv_caches` for models
         # with cross-layer KV sharing

@@ -57,8 +57,6 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 from ucm.sparse.state import (
-            get_ucm_sparse,
-            has_ucm_sparse,
             maybe_execute_sparse_ffn_begin,
             maybe_execute_sparse_ffn_finished,
             maybe_execute_sparse_layer_begin,
