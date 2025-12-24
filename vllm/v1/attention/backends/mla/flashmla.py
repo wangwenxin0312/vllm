@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar, Optional
 
 import torch
-
+import os
 from vllm.attention.backends.abstract import (AttentionType,
                                               is_quantized_kv_cache)
 from vllm.attention.ops.flashmla import (flash_mla_with_kvcache,
@@ -19,6 +19,7 @@ from vllm.v1.attention.backends.mla.common import (MLACommonBackend,
                                                    MLACommonMetadataBuilder)
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.block_table import BlockTable
+from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
 
 logger = init_logger(__name__)
 
@@ -46,6 +47,10 @@ class FlashMLABackend(MLACommonBackend):
 class FlashMLADecodeMetadata(MLACommonDecodeMetadata):
     tile_scheduler_metadata: torch.Tensor
     num_splits: torch.Tensor
+    topk_seq_lens: torch.Tensor
+    topk_tile_scheduler_metadata: torch.Tensor
+    topk_num_splits: torch.Tensor
+    topk_block_table: torch.Tensor = None
 
 
 @dataclass
@@ -74,6 +79,13 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
             self.num_q_heads,
             1, # MQA for the decode path
         )
+        topk_seq_lens = None
+        topk_tile_scheduler_metadata = None
+        topk_num_splits = None
+        if has_ucm_sparse():
+            ucm_sparse = get_ucm_sparse()
+            if os.getenv("VLLM_HASH_ATTENTION") == "1":
+                topk_seq_lens, topk_tile_scheduler_metadata, topk_num_splits = ucm_sparse.build_decode_hash(seq_lens)
 
         if self.runner.full_cuda_graph:
             # First time around (CUDAGraph capture), allocate the static buffer
@@ -98,12 +110,16 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
                 num_splits_view.copy_(num_splits)
                 self.cg_buf_num_splits[n:].fill_(0)  # fill the rest with 0s
                 num_splits = num_splits_view
+                topk_tile_scheduler_metadata, topk_num_splits = ucm_sparse.maybe_init_cudagraph_buffers_for_topk(n, tile_scheduler_metadata)
 
         return FlashMLADecodeMetadata(
             block_table=block_table_tensor,
             seq_lens=seq_lens,
             tile_scheduler_metadata=tile_scheduler_metadata,
             num_splits=num_splits,
+            topk_seq_lens=topk_seq_lens,
+            topk_tile_scheduler_metadata=topk_tile_scheduler_metadata,
+            topk_num_splits=topk_num_splits,
         )
 
 
