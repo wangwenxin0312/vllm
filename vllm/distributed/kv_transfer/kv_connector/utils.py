@@ -3,6 +3,11 @@
 """
 KV cache helper for store.
 """
+from collections import defaultdict
+from collections.abc import Sequence
+from concurrent.futures import CancelledError, Future
+from typing import Optional, cast
+
 import torch
 
 import vllm.envs as envs
