@@ -16,6 +16,8 @@ from vllm.attention.ops.merge_attn_states import merge_attn_states
 from vllm.attention.utils.fa_utils import (flash_attn_supports_fp8,
                                            get_flash_attn_version,
                                            is_flash_attn_varlen_func_available)
+from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
+import os
 
 if is_flash_attn_varlen_func_available():
     from vllm.attention.utils.fa_utils import (flash_attn_varlen_func,
@@ -220,6 +222,11 @@ class FlashAttentionMetadataBuilder(
         seq_lens = common_attn_metadata.seq_lens
         block_table = self.block_table
         block_table_tensor = block_table.get_device_tensor()[:num_reqs]
+
+        if has_ucm_sparse():
+            ucm_sparse = get_ucm_sparse()
+            if os.getenv("VLLM_HASH_ATTENTION") == "1":
+                decode_mask, topk_seq_lens = ucm_sparse.build_decode_attention_meta(query_start_loc, seq_lens, block_table_tensor)
 
         block_table.slot_mapping[:num_actual_tokens].copy_(
             block_table.slot_mapping_cpu[:num_actual_tokens],
