@@ -54,7 +54,12 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
-
+from ucm.sparse.state import (
+            maybe_execute_sparse_ffn_begin,
+            maybe_execute_sparse_ffn_finished,
+            maybe_execute_sparse_layer_begin,
+            maybe_execute_sparse_layer_finished,
+        )
 
 class LlamaMLP(nn.Module):
 
@@ -305,10 +310,16 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.self_attn(positions=positions,
                                        hidden_states=hidden_states)
 
+        hidden_states, residual = maybe_execute_sparse_ffn_begin(
+                hidden_states, residual
+            )
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = maybe_execute_sparse_ffn_finished(
+                hidden_states, residual
+            )
         return hidden_states, residual
 
 
@@ -387,9 +398,17 @@ class LlamaModel(nn.Module):
         aux_hidden_states = []
         for idx, layer in enumerate(
                 self.layers[self.start_layer:self.end_layer]):
+            positions, hidden_states, residual = maybe_execute_sparse_layer_begin(
+                    positions, hidden_states, residual
+                )
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
             hidden_states, residual = layer(positions, hidden_states, residual)
+            positions, hidden_states, residual = (
+                    maybe_execute_sparse_layer_finished(
+                        positions, hidden_states, residual
+                    )
+                )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
