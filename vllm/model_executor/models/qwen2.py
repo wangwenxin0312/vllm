@@ -57,6 +57,10 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 
+import math
+from vllm import envs
+from vllm.forward_context import get_forward_context
+
 
 class Qwen2MLP(nn.Module):
 
@@ -180,8 +184,30 @@ class Qwen2Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
+
+        if envs.VLLM_USE_REROPE:
+            attn_metadata = get_forward_context().attn_metadata
+            REROPE_WINDOW = envs.REROPE_WINDOW
+            TRAINING_LENGTH = envs.TRAINING_LENGTH
+            if attn_metadata and next(iter(attn_metadata.values())).use_rerope:
+                q *= ((positions + 1)[:, None].log() / math.log(TRAINING_LENGTH)).clip(1).to(q.dtype)
+                q2 = q.clone()
+                k2 = k.clone()
+                k0 = k.clone()
+
+                q, k = self.rotary_emb(positions, q, k)
+                q2, _ = self.rotary_emb(positions * 0 + REROPE_WINDOW, q2, k2)
+                del k2
+            else:
+                k0 = k
+                q, k = self.rotary_emb(positions, q, k)
+                q2 = q
+
+            attn_output = self.attn(q, k, v, query2=q2, key2=k0)
+        else:
+            q, k = self.rotary_emb(positions, q, k)
+            attn_output = self.attn(q, k, v)
+
         output, _ = self.o_proj(attn_output)
         return output
 
