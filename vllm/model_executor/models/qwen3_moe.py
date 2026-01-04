@@ -241,7 +241,9 @@ class Qwen3MoeAttention(nn.Module):
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
 
-        if attn_metadata and next(iter(attn_metadata.values())).use_rerope:
+        attn_md  = next(iter(attn_metadata.values())) if attn_metadata else None
+        use_rerope = bool(getattr(attn_md, "use_rerope", False))
+        if use_rerope:
             q *= (
                     ((positions + 1)[:, None].log() / math.log(TRAINING_LENGTH))
                     .clip(1)
@@ -255,9 +257,9 @@ class Qwen3MoeAttention(nn.Module):
             q2, _ = self.rotary_emb(positions * 0 + REROPE_WINDOW, q2, k2)
             del k2
         else:
-            k0 = k.clone()
+            k0 = k
             q, k = self.rotary_emb(positions, q, k)
-            q2 = q.clone()
+            q2 = q
 
         
         if envs.VLLM_USE_REROPE:
