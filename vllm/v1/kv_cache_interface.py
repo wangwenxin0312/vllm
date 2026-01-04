@@ -13,6 +13,8 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils import cdiv, get_dtype_size
 
+from vllm import envs
+
 logger = init_logger(__name__)
 
 
@@ -79,7 +81,12 @@ class AttentionSpec(KVCacheSpec):
     @property
     def page_size_bytes(self) -> int:
         # For MLA we only store a single latent vector
-        coef = 1 if self.use_mla else 2
+        if self.use_mla:
+            coef = 1
+        elif envs.VLLM_USE_REROPE:
+            coef = 3
+        else:
+            coef = 2
         return coef * self.block_size * self.num_kv_heads * self.head_size \
                 * get_dtype_size(self.dtype)
 
