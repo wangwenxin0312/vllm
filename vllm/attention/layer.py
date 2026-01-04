@@ -189,8 +189,8 @@ class Attention(nn.Module):
         self,
         query: torch.Tensor,
         key: torch.Tensor,
-        query2: torch.Tensor,
-        key2: torch.Tensor,
+        query2: Optional[torch.Tensor],
+        key2: Optional[torch.Tensor],
         value: torch.Tensor,
         # For some alternate attention backends like MLA the attention output
         # shape does not match the query shape, so we optionally let the model
@@ -264,7 +264,7 @@ class Attention(nn.Module):
                                          self_kv_cache, attn_metadata)
             else:
                 return torch.ops.vllm.unified_attention(
-                    query, key, query2, key2, value, self.layer_name)
+                    query, key, value, self.layer_name)
 
     def calc_kv_scales(self, query, key, value):
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)
@@ -471,16 +471,26 @@ def unified_attention_with_output(
             query, _, _, _ = maybe_execute_sparse_attention_begin(
                 query, key, value, layer_name, forward_context, output, k_hash=k_hash
             )
-    self.impl.forward(self,
-                      query,
-                      key,
-                      query2,
-                      key2,
-                      value,
-                      kv_cache,
-                      attn_metadata,
-                      output=output,
-                      output_scale=output_scale)
+    if envs.VLLM_USE_REROPE:
+        self.impl.forward(self,
+                        query,
+                        key,
+                        query2,
+                        key2,
+                        value,
+                        kv_cache,
+                        attn_metadata,
+                        output=output,
+                        output_scale=output_scale)
+    else:
+        self.impl.forward(self,
+                        query,
+                        key,
+                        value,
+                        kv_cache,
+                        attn_metadata,
+                        output=output,
+                        output_scale=output_scale)
     if not self.use_mla:
         maybe_execute_sparse_attention_finished(
             query, key, value, output, layer_name, forward_context
