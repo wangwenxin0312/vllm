@@ -187,6 +187,8 @@ class Attention(nn.Module):
         self,
         query: torch.Tensor,
         key: torch.Tensor,
+        query2: torch.Tensor,
+        key2: torch.Tensor,
         value: torch.Tensor,
         # For some alternate attention backends like MLA the attention output
         # shape does not match the query shape, so we optionally let the model
@@ -224,6 +226,10 @@ class Attention(nn.Module):
                 output = output.view(-1, self.num_heads, self.head_size)
                 if key is not None:
                     key = key.view(-1, self.num_kv_heads, self.head_size)
+                if query2 is not None:
+                    query2 = query2.view(-1, self.num_heads, self.head_size)
+                if key2 is not None:
+                    key2 = key2.view(-1, self.num_kv_heads, self.head_size)
                 if value is not None:
                     value = value.view(-1, self.num_kv_heads, self.head_size)
             if self.use_direct_call:
@@ -235,13 +241,15 @@ class Attention(nn.Module):
                 self.impl.forward(self,
                                   query,
                                   key,
+                                  query2,
+                                  key2,
                                   value,
                                   self_kv_cache,
                                   attn_metadata,
                                   output=output)
             else:
                 torch.ops.vllm.unified_attention_with_output(
-                    query, key, value, output, self.layer_name)
+                    query, key, query2, key2, value, output, self.layer_name)
             return output.view(-1, hidden_size)
         else:
             if self.use_direct_call:
@@ -250,11 +258,11 @@ class Attention(nn.Module):
                 if isinstance(attn_metadata, dict):
                     attn_metadata = attn_metadata[self.layer_name]
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
-                return self.impl.forward(self, query, key, value,
+                return self.impl.forward(self, query, key, query2, key2, value,
                                          self_kv_cache, attn_metadata)
             else:
                 return torch.ops.vllm.unified_attention(
-                    query, key, value, self.layer_name)
+                    query, key, query2, key2, value, self.layer_name)
 
     def calc_kv_scales(self, query, key, value):
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)
@@ -437,6 +445,8 @@ direct_register_custom_op(
 def unified_attention_with_output(
     query: torch.Tensor,
     key: torch.Tensor,
+    query2: torch.Tensor,
+    key2: torch.Tensor,
     value: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
@@ -452,6 +462,8 @@ def unified_attention_with_output(
     self.impl.forward(self,
                       query,
                       key,
+                      query2,
+                      key2,
                       value,
                       kv_cache,
                       attn_metadata,
@@ -464,6 +476,8 @@ def unified_attention_with_output(
 def unified_attention_with_output_fake(
     query: torch.Tensor,
     key: torch.Tensor,
+    query2: torch.Tensor,
+    key2: torch.Tensor,
     value: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
