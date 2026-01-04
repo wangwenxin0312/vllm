@@ -13,6 +13,8 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils import cdiv, get_dtype_size
 
+from vllm import envs
+
 logger = init_logger(__name__)
 
 
@@ -79,7 +81,12 @@ class AttentionSpec(KVCacheSpec):
     @property
     def page_size_bytes(self) -> int:
         # For MLA we only store a single latent vector
-        coef = 1 if self.use_mla else 2
+        if self.use_mla:
+            coef = 1
+        elif envs.VLLM_USE_REROPE:
+            coef = 3
+        else:
+            coef = 2
         return coef * self.block_size * self.num_kv_heads * self.head_size \
                 * get_dtype_size(self.dtype)
 
@@ -88,10 +95,10 @@ class AttentionSpec(KVCacheSpec):
 class FullAttentionSpec(AttentionSpec):
     sliding_window: Optional[int] = None
     """
-    When hybrid allocator is disabled and the model contains both full 
-    attention layers and sliding window attention layers, sliding 
-    window attention are regarded as full attention in KV cache manager 
-    (blocks are allocated for all tokens), while computed as sliding window 
+    When hybrid allocator is disabled and the model contains both full
+    attention layers and sliding window attention layers, sliding
+    window attention are regarded as full attention in KV cache manager
+    (blocks are allocated for all tokens), while computed as sliding window
     attention in model runner.
     In this case, we use FullAttentionSpec and record the sliding window size.
     Default to None for not using sliding window attention.
@@ -108,7 +115,7 @@ class FullAttentionSpec(AttentionSpec):
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
         """
-        Merge a list of FullAttentionSpec objects into a single 
+        Merge a list of FullAttentionSpec objects into a single
         FullAttentionSpec object.
         """
         merged_spec = super().merge(specs)

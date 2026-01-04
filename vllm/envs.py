@@ -83,6 +83,9 @@ if TYPE_CHECKING:
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_USE_V1: bool = True
+    VLLM_USE_REROPE: bool = False
+    REROPE_WINDOW: int = 32768
+    TRAINING_LENGTH: int = 32768
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
@@ -636,6 +639,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, use the V1 code path.
     "VLLM_USE_V1":
     lambda: bool(int(os.getenv("VLLM_USE_V1", "1"))),
+
+    # add REROPE
+    "VLLM_USE_REROPE":
+    lambda: str(os.getenv("VLLM_USE_REROPE", "0")).lower() in {"1", "true", "yes", "on"},
+
+    # add REROPE setting
+    "REROPE_WINDOW":
+    lambda: int(os.getenv("REROPE_WINDOW", "32768")),
+    "TRAINING_LENGTH":
+    lambda: int(os.getenv("TRAINING_LENGTH", "32768")),
 
     # Disable aiter ops unless specifically enabled.
     # Acts as a parent switch to enable the rest of the other operations.
