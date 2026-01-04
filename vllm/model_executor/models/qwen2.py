@@ -56,6 +56,16 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
+from ucm.sparse.state import (
+            maybe_execute_sparse_ffn_begin,
+            maybe_execute_sparse_ffn_finished,
+            maybe_execute_sparse_layer_begin,
+            maybe_execute_sparse_layer_finished,
+        )
+
+import math
+from vllm import envs
+from vllm.forward_context import get_forward_context
 
 
 class Qwen2MLP(nn.Module):
@@ -178,10 +188,31 @@ class Qwen2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        attn_metadata = get_forward_context().attn_metadata
+        REROPE_WINDOW = envs.REROPE_WINDOW
+        TRAINING_LENGTH = envs.TRAINING_LENGTH
+
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
+
+        if attn_metadata and next(iter(attn_metadata.values())).use_rerope:
+            q *= ((positions + 1)[:, None].log() / math.log(TRAINING_LENGTH)).clip(1).to(q.dtype)
+            q2 = q.clone()
+            k2 = k.clone()
+            k0 = k.clone()
+
+            q, k = self.rotary_emb(positions, q, k)
+            q2, _ = self.rotary_emb(positions * 0 + REROPE_WINDOW, q2, k2)
+            del k2
+        else:
+            k0 = k.clone()
+            q, k = self.rotary_emb(positions, q, k)
+            q2 = q.clone()
+
+        if envs.VLLM_USE_REROPE:
+            attn_output = self.attn(q, k, q2, k0, v)
+        else:
+            attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -255,11 +286,16 @@ class Qwen2DecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
-
+        residual, hidden_states = maybe_execute_sparse_ffn_begin(
+                residual, hidden_states
+            )
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        residual, hidden_states = maybe_execute_sparse_ffn_finished(
+                residual, hidden_states
+            )
         return hidden_states, residual
 
 
@@ -352,11 +388,21 @@ class Qwen2Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
         for layer in self.layers[self.start_layer:self.end_layer]:
+            positions, hidden_states, residual = maybe_execute_sparse_layer_begin(
+                positions,
+                hidden_states,
+                residual,
+            )
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 residual,
             )
+            positions, hidden_states, residual = (
+                    maybe_execute_sparse_layer_finished(
+                        positions, hidden_states, residual
+                    )
+                )
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,
