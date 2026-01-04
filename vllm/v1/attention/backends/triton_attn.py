@@ -23,6 +23,8 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.block_table import BlockTable
 
+from vllm.attention.ops.triton_unified_attention_rerope import unified_attention_rerope
+
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -46,6 +48,8 @@ class TritonAttentionMetadata:
     seq_lens: torch.Tensor
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
+
+    use_rerope: bool
 
     # For cascade attention.
     use_cascade: bool
@@ -99,6 +103,8 @@ class TritonAttentionMetadataBuilder(
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         max_query_len = common_attn_metadata.max_query_len
+
+        use_rerope = common_attn_metadata.use_rerope
 
         max_seq_len = int(self.runner.seq_lens_np[:num_reqs].max())
         query_start_loc = common_attn_metadata.query_start_loc
@@ -177,6 +183,7 @@ class TritonAttentionMetadataBuilder(
             suffix_kv_lens=suffix_kv_lens,
             local_attn_metadata=local_attn_metadata,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
+            use_rerope = use_rerope
         )
         return attn_metadata
 
@@ -226,6 +233,8 @@ class TritonAttentionBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
+        if envs.VLLM_USE_REROPE:
+            return (3, num_blocks, block_size, num_kv_heads, head_size)
         return (2, num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -299,6 +308,8 @@ class TritonAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: FlashAttentionMetadata,
+        query2: Optional[torch.Tensor] = None,
+        key2: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -342,7 +353,10 @@ class TritonAttentionImpl(AttentionImpl):
             key_cache, value_cache = PagedAttention.split_kv_cache(
                 kv_cache, self.num_kv_heads, self.head_size)
         else:
-            key_cache, value_cache = kv_cache.unbind(0)
+            if envs.VLLM_USE_REROPE:
+                key_cache, value_cache, key_cache2 = kv_cache.unbind(0)
+            else:
+                key_cache, value_cache = kv_cache.unbind(0)
 
         if self.kv_sharing_target_layer_name is None:
             # Reshape the input keys and values and store them in the cache.
@@ -370,8 +384,22 @@ class TritonAttentionImpl(AttentionImpl):
                     layer._v_scale,
                 )
 
+                if envs.VLLM_USE_REROPE and key2 is not None:
+                    torch.ops._C_cache_ops.reshape_and_cache_flash(
+                        key2,
+                        value,
+                        key_cache2,
+                        value_cache,
+                        attn_metadata.slot_mapping,
+                        self.kv_cache_dtype,
+                        layer._k_scale,
+                        layer._v_scale,
+                    )
+
         if self.kv_cache_dtype.startswith("fp8"):
             key_cache = key_cache.view(self.fp8_dtype)
+            if envs.VLLM_USE_REROPE and key_cache2 is not None:
+                key_cache2 = key_cache2.view(self.fp8_dtype)
             value_cache = value_cache.view(self.fp8_dtype)
             num_tokens, num_heads, head_size = query.shape
             assert layer._q_scale == 1.0, \
@@ -384,6 +412,12 @@ class TritonAttentionImpl(AttentionImpl):
                         (num_tokens, num_heads * head_size)).contiguous(),
                     layer._q_scale)
                 query = query.reshape((num_tokens, num_heads, head_size))
+                if envs.VLLM_USE_REROPE and query2 is not None:
+                    query2, _ = ops.scaled_fp8_quant(
+                        query2.reshape(
+                            (num_tokens, num_heads * head_size)).contiguous(),
+                        layer._q_scale)
+                    query2 = query2.reshape((num_tokens, num_heads, head_size))
 
         use_local_attn = \
             (self.use_irope and attn_metadata.local_attn_metadata is not None)
@@ -403,47 +437,71 @@ class TritonAttentionImpl(AttentionImpl):
             max_seqlen_k = attn_metadata.max_seq_len
             block_table = attn_metadata.block_table
 
+
         if use_prefill_decode_attn:
             # Compute attention and update output up to `num_actual_tokens`.
             chunked_prefill_paged_decode(query=query[:num_actual_tokens],
-                                         key=key[:num_actual_tokens],
-                                         value=value[:num_actual_tokens],
-                                         output=output[:num_actual_tokens],
-                                         kv_cache_dtype=self.kv_cache_dtype,
-                                         key_cache=key_cache,
-                                         value_cache=value_cache,
-                                         block_table=block_table,
-                                         query_start_loc=cu_seqlens_q,
-                                         seq_lens=seqused_k,
-                                         max_seq_len=max_seqlen_k,
-                                         max_query_len=max_seqlen_q,
-                                         k_scale=layer._k_scale,
-                                         v_scale=layer._v_scale,
-                                         alibi_slopes=self.alibi_slopes,
-                                         sliding_window=self.sliding_window[0],
-                                         sm_scale=self.scale)
-
+                                        key=key[:num_actual_tokens],
+                                        value=value[:num_actual_tokens],
+                                        output=output[:num_actual_tokens],
+                                        kv_cache_dtype=self.kv_cache_dtype,
+                                        key_cache=key_cache,
+                                        value_cache=value_cache,
+                                        block_table=block_table,
+                                        query_start_loc=cu_seqlens_q,
+                                        seq_lens=seqused_k,
+                                        max_seq_len=max_seqlen_k,
+                                        max_query_len=max_seqlen_q,
+                                        k_scale=layer._k_scale,
+                                        v_scale=layer._v_scale,
+                                        alibi_slopes=self.alibi_slopes,
+                                        sliding_window=self.sliding_window[0],
+                                        sm_scale=self.scale)
         else:
             descale_shape = (cu_seqlens_q.shape[0] - 1, key.shape[1])
 
-            unified_attention(
-                q=query[:num_actual_tokens],
-                k=key_cache,
-                v=value_cache,
-                out=output[:num_actual_tokens],
-                cu_seqlens_q=cu_seqlens_q,
-                max_seqlen_q=max_seqlen_q,
-                seqused_k=seqused_k,
-                max_seqlen_k=max_seqlen_k,
-                softmax_scale=self.scale,
-                causal=True,
-                alibi_slopes=self.alibi_slopes,
-                window_size=self.sliding_window,
-                block_table=block_table,
-                softcap=self.logits_soft_cap,
-                q_descale=None,  # Not supported
-                k_descale=layer._k_scale.expand(descale_shape),
-                v_descale=layer._v_scale.expand(descale_shape),
-            )
+            if attn_metadata.use_rerope:
+                unified_attention_rerope(
+                    q=query[:num_actual_tokens],
+                    k=key_cache,
+                    q2=query2[:num_actual_tokens],
+                    k2=key_cache2,
+                    v=value_cache,
+                    out=output[:num_actual_tokens],
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    seqused_k=seqused_k,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    rerope_window=envs.REROPE_WINDOW,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=self.sliding_window,
+                    block_table=block_table,
+                    softcap=self.logits_soft_cap,
+                    q_descale=None,  # Not supported
+                    k_descale=layer._k_scale.expand(descale_shape),
+                    v_descale=layer._v_scale.expand(descale_shape),
+                )
+            else:
+                unified_attention(
+                    q=query[:num_actual_tokens],
+                    k=key_cache,
+                    v=value_cache,
+                    out=output[:num_actual_tokens],
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    seqused_k=seqused_k,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=self.sliding_window,
+                    block_table=block_table,
+                    softcap=self.logits_soft_cap,
+                    q_descale=None,  # Not supported
+                    k_descale=layer._k_scale.expand(descale_shape),
+                    v_descale=layer._v_scale.expand(descale_shape),
+                )
 
         return output
