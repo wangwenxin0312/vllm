@@ -112,6 +112,7 @@ class IterationStats:
 
             first_token_latency = self._time_since(req_stats.arrival_time)
             self.time_to_first_tokens_iter.append(first_token_latency)
+            print(f"req: {output.request_id}, ttft: {first_token_latency}")
 
         req_stats.num_generation_tokens += num_new_generation_tokens
 
@@ -126,6 +127,7 @@ class IterationStats:
         else:
             tpot = engine_core_timestamp - req_stats.last_token_ts
             self.time_per_output_tokens_iter.append(tpot)
+            print(f"req: {output.request_id}, tpot: {tpot}")
 
         req_stats.last_token_ts = engine_core_timestamp
 
