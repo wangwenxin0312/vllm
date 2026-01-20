@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -155,3 +155,8 @@ class SchedulerOutput:
 
     # KV Cache Connector metadata.
     kv_connector_metadata: Optional[KVConnectorMetadata] = None
+
+    # modified slots by sparse algorithm
+    req_sparsed_slots: dict[str, int] = None
+    # The number of tokens computed externally for each request
+    num_external_computed_tokens_per_req: dict[str, int] = field(default_factory=dict)
