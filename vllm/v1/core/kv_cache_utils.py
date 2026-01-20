@@ -1035,6 +1035,20 @@ def get_kv_cache_config_from_groups(vllm_config: VllmConfig,
         num_blocks = available_memory // kv_cache_groups[
             0].kv_cache_spec.page_size_bytes
         num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+
+        if os.getenv("VLLM_HASH_ATTENTION") == "1":
+            from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
+
+            if vllm_config.cache_config.cache_dtype == 'auto':
+                dtype = vllm_config.model_config.dtype
+            else:
+                dtype = STR_DTYPE_TO_TORCH_DTYPE[vllm_config.cache_config.cache_dtype]
+            khash_scale = dtype.itemsize * 8
+            new_num_blocks = num_blocks * khash_scale // (khash_scale + 1)
+            logger.info("[HASH_ATTN] reduce num_blocks from %d to %d to allocate khash_cache",
+                        num_blocks, new_num_blocks)
+            num_blocks = new_num_blocks
+
         per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
         kv_cache_tensors = [
             KVCacheTensor(size=per_layer_specs[layer_name].page_size_bytes *

@@ -194,6 +194,7 @@ from typing import Generic, Optional, TypeVar, Union
 
 import torch
 from tqdm import tqdm
+import os
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
@@ -219,6 +220,10 @@ from vllm.v1.attention.backends.utils import (AttentionMetadataBuilder,
                                               infer_global_hyperparameters,
                                               split_decodes_and_prefills)
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.attention.layer import (maybe_execute_sparse_attention_begin,
+                                  maybe_execute_sparse_attention_finished)
 
 try:
     from vllm.vllm_flash_attn import flash_attn_varlen_func
@@ -1640,6 +1645,8 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
 
+        forward_context: ForwardContext = get_forward_context()
+
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
                 "fused output quantization is not yet supported"
@@ -1689,6 +1696,11 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         prefill_k_pe = k_pe[num_decode_tokens:]
         prefill_k_c_normed = k_c_normed[num_decode_tokens:]
 
+        if os.getenv("VLLM_HASH_ATTENTION") == "1":
+            kv_cache, k_hash = kv_cache
+        else:
+            k_hash = None
+
         # write the latent and rope to kv cache
         if kv_cache.numel() > 0:
             ops.concat_and_cache_mla(
@@ -1704,9 +1716,14 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
         if has_prefill:
+
+            prefill_q, k_c_normed, k_pe, output =  maybe_execute_sparse_attention_begin(prefill_q, k_c_normed, k_pe, layer.layer_name, forward_context, output=output, phase="prefill", k_hash=k_hash)
+
             output[num_decode_tokens:] = self._forward_prefill(
                 prefill_q, prefill_k_c_normed, prefill_k_pe, kv_cache,
                 attn_metadata, layer._k_scale)
+
+            maybe_execute_sparse_attention_finished(prefill_q, prefill_k_c_normed, prefill_k_pe, output[num_decode_tokens:], layer.layer_name, forward_context, "prefill")
 
         if has_decode:
             assert attn_metadata.decode is not None
@@ -1771,8 +1788,12 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 decode_q = get_dcp_group().all_gather(decode_q, dim=1)
 
             # call decode attn
+            _, k_c_normed, k_pe, output = maybe_execute_sparse_attention_begin(torch.cat([decode_ql_nope, decode_q_pe],dim=-1), k_c_normed, k_pe, layer.layer_name, forward_context, output=output, phase="decode", k_hash=k_hash, decode_ql_nope=decode_ql_nope, decode_q_pe=decode_q_pe)
+
             attn_out, lse = self._forward_decode(decode_q, kv_cache,
                                                  attn_metadata, layer)
+
+            maybe_execute_sparse_attention_finished(torch.cat([decode_ql_nope, decode_q_pe],dim=-1), decode_ql_nope, decode_q_pe, output[:num_decode_tokens], layer.layer_name, forward_context, "decode")
 
             # recorect dcp attn_out with lse.
             if self.dcp_world_size > 1:
