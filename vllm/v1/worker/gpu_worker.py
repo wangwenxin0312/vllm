@@ -28,6 +28,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.worker_base import WorkerBase
+from ucm.sparse.state import ensure_ucm_sparse_initialized
 
 logger = init_logger(__name__)
 
@@ -386,6 +387,7 @@ def init_worker_distributed_environment(
                                       parallel_config.pipeline_parallel_size)
 
     ensure_kv_transfer_initialized(vllm_config)
+    ensure_ucm_sparse_initialized(vllm_config)
 
 
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):
