@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import vllm.envs as envs
+import os
 from vllm.attention import AttentionType
 from vllm.attention.selector import backend_name_to_enum, get_attn_backend
 from vllm.config import CacheConfig, get_current_vllm_config
@@ -22,6 +23,7 @@ from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.platforms import _Backend, current_platform
 from vllm.utils import direct_register_custom_op
 from vllm.v1.attention.backends.utils import validate_kv_sharing_target
+from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
 
 
 class Attention(nn.Module):
@@ -444,8 +446,10 @@ def unified_attention(
         output = self.impl.forward(self, query, key, value, kv_cache,
                                attn_metadata, query2=query2, key2=key2)
     else:
+        query, key, value, _ = maybe_execute_sparse_attention_begin(query, key, value, layer_name, forward_context)
         output = self.impl.forward(self, query, key, value, kv_cache,
                                 attn_metadata)
+        maybe_execute_sparse_attention_finished(query, key, value, output, layer_name, forward_context)
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
     return output
@@ -500,6 +504,15 @@ def unified_attention_with_output(
                         output=output,
                         output_scale=output_scale)
     else:
+        if not self.use_mla:
+            if attn_metadata is not None:
+                if os.getenv("VLLM_HASH_ATTENTION") == "1":
+                    kv_cache, k_hash = kv_cache
+                else:
+                    k_hash = None
+                query, key, value, output = maybe_execute_sparse_attention_begin(
+                    query, key, value, layer_name, forward_context, output, k_hash=k_hash
+                )
         self.impl.forward(self,
                         query,
                         key,
@@ -508,6 +521,10 @@ def unified_attention_with_output(
                         attn_metadata,
                         output=output,
                         output_scale=output_scale)
+        if not self.use_mla:
+            maybe_execute_sparse_attention_finished(
+                query, key, value, output, layer_name, forward_context
+            )
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
 
 
@@ -531,3 +548,48 @@ direct_register_custom_op(
     fake_impl=unified_attention_with_output_fake,
     dispatch_key=current_platform.dispatch_key,
 )
+
+def maybe_execute_sparse_attention_begin(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        layer_name: str,
+        forward_context: ForwardContext,
+        output: Optional[torch.Tensor] = None,
+        phase: Optional[str] = None,
+        k_hash: Optional[torch.Tensor] = None,
+        decode_ql_nope: Optional[torch.Tensor] = None,
+        decode_q_pe: Optional[torch.Tensor] = None,
+):
+    if not has_ucm_sparse():
+            return query, key, value, output
+
+    ucm_sparse = get_ucm_sparse()
+
+    attn_metadata = forward_context.attn_metadata
+    if attn_metadata is None:
+        return query, key, value, output
+
+    return ucm_sparse.attention_begin(
+        query, key, value, layer_name, forward_context, output, phase, k_hash, decode_ql_nope, decode_q_pe
+    )
+
+def maybe_execute_sparse_attention_finished(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_output: torch.Tensor,
+        layer_name: str,
+        forward_context: ForwardContext,
+        phase: Optional[str] = None,
+):
+    if not has_ucm_sparse():
+        return
+
+    ucm_sparse = get_ucm_sparse()
+
+    attn_metadata = forward_context.attn_metadata
+    if attn_metadata is None:
+        return
+
+    ucm_sparse.attention_finished(query, key, value, attn_output, layer_name, forward_context, phase)

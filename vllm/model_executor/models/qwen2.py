@@ -56,6 +56,12 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
+from ucm.sparse.state import (
+            maybe_execute_sparse_ffn_begin,
+            maybe_execute_sparse_ffn_finished,
+            maybe_execute_sparse_layer_begin,
+            maybe_execute_sparse_layer_finished,
+        )
 
 from ucm.sparse.rerope.attn_forward_utils import process_qkv
 
@@ -258,11 +264,16 @@ class Qwen2DecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
         )
-
+        residual, hidden_states = maybe_execute_sparse_ffn_begin(
+                residual, hidden_states
+            )
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        residual, hidden_states = maybe_execute_sparse_ffn_finished(
+                residual, hidden_states
+            )
         return hidden_states, residual
 
 
@@ -355,11 +366,21 @@ class Qwen2Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
         for layer in self.layers[self.start_layer:self.end_layer]:
+            positions, hidden_states, residual = maybe_execute_sparse_layer_begin(
+                positions,
+                hidden_states,
+                residual,
+            )
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 residual,
             )
+            positions, hidden_states, residual = (
+                    maybe_execute_sparse_layer_finished(
+                        positions, hidden_states, residual
+                    )
+                )
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,
