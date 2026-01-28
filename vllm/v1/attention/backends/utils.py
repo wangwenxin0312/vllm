@@ -46,7 +46,7 @@ class CommonAttentionMetadata:
     """
     Per-batch attention metadata, shared across layers and backends.
     AttentionMetadataBuilder instances use it to construct per-layer metadata.
-    
+
     For many of the tensors we keep both GPU and CPU versions.
     """
 
@@ -71,6 +71,8 @@ class CommonAttentionMetadata:
     max_seq_len: int
     """Longest context length in batch"""
 
+    use_rerope: bool
+
     block_table_tensor: torch.Tensor
     slot_mapping: torch.Tensor
 
@@ -89,7 +91,7 @@ def slice_query_start_locs(
     request_slice: slice,
 ) -> torch.Tensor:
     """
-    Creates a new query_start_loc that corresponds to the requests in 
+    Creates a new query_start_loc that corresponds to the requests in
     request_slice.
 
     Note: This function creates a new tensor to hold the new query_start_locs.
@@ -103,7 +105,7 @@ def _make_metadata_with_slice(
         ubatch_slice: UBatchSlice,
         attn_metadata: CommonAttentionMetadata) -> CommonAttentionMetadata:
     """
-    This function creates a new CommonAttentionMetadata that corresponds to 
+    This function creates a new CommonAttentionMetadata that corresponds to
     the requests included in ubatch_slice
     """
 
@@ -196,7 +198,7 @@ def split_attn_metadata(
     common_attn_metadata: CommonAttentionMetadata,
 ) -> list[CommonAttentionMetadata]:
     """
-    Creates a new CommonAttentionMetadata instance that corresponds to the 
+    Creates a new CommonAttentionMetadata instance that corresponds to the
     requests for each UBatchSlice in ubatch_slices.
 
     Note: This function does not modify common_attn_metadata
@@ -221,7 +223,7 @@ class AttentionCGSupport(enum.Enum):
     """Cudagraph always supported; supports mixed-prefill-decode"""
     UNIFORM_BATCH = 2
     """Cudagraph supported for batches the only contain query lengths that are
-    the same, this can be used for spec-decode 
+    the same, this can be used for spec-decode
         i.e. "decodes" are 1 + num_speculative_tokens"""
     UNIFORM_SINGLE_TOKEN_DECODE = 1
     """Cudagraph supported for batches the only contain query_len==1 decodes"""
@@ -270,7 +272,7 @@ class AttentionMetadataBuilder(abc.ABC, Generic[M]):
         """
         Central method that builds attention metadata.
         Some builders (MLA) require reorder_batch to be called prior to build.
-        
+
         Args:
             common_prefix_len: The length of the common prefix of the batch.
             common_attn_metadata: The common attention metadata.
@@ -314,7 +316,7 @@ class AttentionMetadataBuilder(abc.ABC, Generic[M]):
     ) -> M:
         """
         Build attention metadata for draft model. Uses build by default.
-        
+
         Args:
             common_attn_metadata: The common attention metadata.
             draft_index: The index of the current draft operation.
@@ -416,7 +418,7 @@ def get_per_layer_parameters(
 def infer_global_hyperparameters(
         per_layer_params: dict[str, PerLayerParameters]) -> PerLayerParameters:
     """
-    Currently, FlashInfer backend other than trtllm-gen 
+    Currently, FlashInfer backend other than trtllm-gen
     only support models in which all layers share
     the same values for the following hyperparameters:
     - `window_left`
@@ -779,7 +781,7 @@ def reorder_batch_to_split_decodes_and_prefills(
     """
     Reorders the batch to split into prefill and decode requests; places all
     requests with <= decode_threshold tokens at the front of the batch.
-    
+
     Returns:
         True if the batch was modified, False otherwise.
     """

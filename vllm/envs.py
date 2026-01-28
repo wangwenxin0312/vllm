@@ -100,6 +100,9 @@ if TYPE_CHECKING:
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_DISABLE_NCCL_FOR_DP_SYNCHRONIZATION: bool = False
     VLLM_USE_V1: bool = True
+    VLLM_USE_REROPE: bool = False
+    REROPE_WINDOW: int = 32768
+    TRAINING_LENGTH: int = 32768
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
@@ -240,13 +243,13 @@ def env_with_choices(
         case_sensitive: bool = True) -> Callable[[], Optional[str]]:
     """
     Create a lambda that validates environment variable against allowed choices
-    
+
     Args:
         env_name: Name of the environment variable
         default: Default value if not set (can be None)
         choices: List of valid string options or callable that returns list
         case_sensitive: Whether validation should be case sensitive
-        
+
     Returns:
         Lambda function for environment_variables dict
     """
@@ -281,15 +284,15 @@ def env_list_with_choices(
         choices: Union[list[str], Callable[[], list[str]]],
         case_sensitive: bool = True) -> Callable[[], list[str]]:
     """
-    Create a lambda that validates environment variable 
+    Create a lambda that validates environment variable
     containing comma-separated values against allowed choices
-    
+
     Args:
         env_name: Name of the environment variable
         default: Default list of values if not set
         choices: List of valid string options or callable that returns list
         case_sensitive: Whether validation should be case sensitive
-        
+
     Returns:
         Lambda function for environment_variables
         dict that returns list of strings
@@ -899,6 +902,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, use the V1 code path.
     "VLLM_USE_V1":
     lambda: bool(int(os.getenv("VLLM_USE_V1", "1"))),
+
+    # add REROPE
+    "VLLM_USE_REROPE":
+    lambda: str(os.getenv("VLLM_USE_REROPE", "0")).lower() in {"1", "true", "yes", "on"},
+
+    # add REROPE setting
+    "REROPE_WINDOW":
+    lambda: int(os.getenv("REROPE_WINDOW", "32768")),
+    "TRAINING_LENGTH":
+    lambda: int(os.getenv("TRAINING_LENGTH", "32768")),
 
     # Disable aiter ops unless specifically enabled.
     # Acts as a parent switch to enable the rest of the other operations.

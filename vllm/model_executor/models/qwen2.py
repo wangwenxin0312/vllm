@@ -58,12 +58,15 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 
+from ucm.sparse.rerope.attn_forward_utils import process_qkv
+
 from ucm.sparse.state import(
     maybe_execute_sparse_ffn_begin,
     maybe_execute_sparse_ffn_finished,
     maybe_execute_sparse_layer_begin,
     maybe_execute_sparse_layer_finished,
 )
+
 
 class Qwen2MLP(nn.Module):
 
@@ -189,8 +192,9 @@ class Qwen2Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
+
+        attn_output = process_qkv(self, positions, q, k, v)
+
         output, _ = self.o_proj(attn_output)
         return output
 

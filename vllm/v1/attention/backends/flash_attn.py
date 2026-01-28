@@ -6,6 +6,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+import os
 
 from vllm import envs
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
@@ -30,6 +31,8 @@ from vllm.v1.attention.backends.utils import (AttentionCGSupport,
                                               CommonAttentionMetadata,
                                               get_kv_cache_layout)
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
 
 logger = init_logger(__name__)
 
@@ -236,6 +239,14 @@ class FlashAttentionMetadataBuilder(
         seq_lens = common_attn_metadata.seq_lens
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu
         block_table_tensor = common_attn_metadata.block_table_tensor
+
+        if has_ucm_sparse():
+            ucm_sparse = get_ucm_sparse()
+            if os.getenv("VLLM_HASH_ATTENTION") == "1":
+                decode_mask, topk_seq_lens = ucm_sparse.build_decode_attention_meta(
+                    query_start_loc, seq_lens, block_table_tensor
+                )
+
         slot_mapping = common_attn_metadata.slot_mapping
         causal = common_attn_metadata.causal
 

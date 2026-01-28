@@ -115,6 +115,8 @@ from .utils import (AttentionGroup, MultiModalBudget,
                     gather_mm_placeholders, sanity_check_mm_encoder_outputs,
                     scatter_mm_placeholders)
 
+from vllm import envs
+
 from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
 from ucm.sparse.base import INVALID_SLOT
 
@@ -160,7 +162,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
 
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
-        
+
         This function blocks until the copy is finished.
         """
         self._async_copy_ready_event.synchronize()
@@ -444,6 +446,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             dtype=torch.int64,
             device="cpu",
             pin_memory=self.pin_memory)
+
+        # use_rerope: current batch rerope state
+        # use_rerope_map: save every request rerope state
+        self.use_rerope = False
+        self.use_rerope_map: dict[str, bool] = {}
 
     def _make_buffer(self,
                      *size: Union[int, torch.SymInt],
@@ -841,7 +848,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def _prepare_input_ids(self, total_num_scheduled_tokens: int,
                            cu_num_tokens: np.ndarray) -> None:
         """Prepare the input IDs for the current batch.
-        
+
         Carefully handles the `prev_sampled_token_ids` which can be cached
         from the previous engine iteration, in which case those tokens on the
         GPU need to be copied into the corresponding slots into input_ids."""
@@ -957,6 +964,15 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
         num_scheduled_tokens = np.array(tokens, dtype=np.int32)
         max_num_scheduled_tokens = max(tokens)
+
+        # Setting use_rerope
+        if envs.VLLM_USE_REROPE:
+            use_rerope_this_batch = False
+            for req in scheduler_output.scheduled_new_reqs:
+                self.use_rerope_map[req.req_id] = len(req.prompt_token_ids) > envs.REROPE_WINDOW
+            for req_id in req_ids:
+                use_rerope_this_batch |= self.use_rerope_map[req_id]
+            self.use_rerope = use_rerope_this_batch
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -1228,6 +1244,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_actual_tokens=total_num_scheduled_tokens,
                 max_query_len=max_num_scheduled_tokens,
                 max_seq_len=max_seq_len,
+                use_rerope=self.use_rerope,
                 block_table_tensor=blk_table_tensor,
                 slot_mapping=slot_mapping,
                 logits_indices_padded=logits_indices_padded,
