@@ -72,6 +72,8 @@ from ..sample.logits_processor import LogitsProcessorManager
 from .utils import (gather_mm_placeholders, initialize_kv_cache_for_kv_sharing,
                     sanity_check_mm_encoder_outputs, scatter_mm_placeholders)
 
+from vllm import envs
+
 if TYPE_CHECKING:
     import xgrammar as xgr
     import xgrammar.kernels.apply_token_bitmask_inplace_torch_compile as xgr_torch_compile  # noqa: E501
@@ -316,6 +318,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # means this layer will perform attention using the keys and values
         # from the KV cache of `shared_kv_cache_layers[layer_name]`.
         self.shared_kv_cache_layers: dict[str, str] = {}
+
+        # use_rerope: current batch rerope state
+        # use_rerope_map: save every request rerope state
+        self.use_rerope = False
+        self.use_rerope_map: dict[str, bool] = {}
 
     def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> None:
         """
@@ -602,6 +609,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_scheduled_tokens = np.array(tokens, dtype=np.int32)
         max_num_scheduled_tokens = max(tokens)
 
+        # Setting use_rerope
+        if envs.VLLM_USE_REROPE:
+            use_rerope_this_batch = False
+            for req in scheduler_output.scheduled_new_reqs:
+                self.use_rerope_map[req.req_id] = len(req.prompt_token_ids) > envs.REROPE_WINDOW
+            for req_id in req_ids:
+                use_rerope_this_batch |= self.use_rerope_map[req_id]
+            self.use_rerope = use_rerope_this_batch
+
+
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
         req_indices = np.repeat(self.arange_np[:num_reqs],
@@ -705,6 +722,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_reqs=num_reqs,
             num_actual_tokens=total_num_scheduled_tokens,
             max_query_len=max_num_scheduled_tokens,
+            use_rerope=self.use_rerope
         )
 
         attn_metadata: dict[str, Any] = {}
@@ -1943,7 +1961,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         Randomize input_ids if VLLM_RANDOMIZE_DP_DUMMY_INPUTS is set.
         This is to help balance expert-selection
          - during profile_run
-         - during DP rank dummy run 
+         - during DP rank dummy run
         """
         dp_size = self.vllm_config.parallel_config.data_parallel_size
         randomize_inputs = envs.VLLM_RANDOMIZE_DP_DUMMY_INPUTS and dp_size > 1

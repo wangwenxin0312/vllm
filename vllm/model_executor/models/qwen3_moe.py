@@ -56,6 +56,8 @@ from .utils import (AutoWeightsLoader, extract_layer_index,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 
+from ucm.sparse.rerope.attn_forward_utils import process_qkv
+
 logger = init_logger(__name__)
 
 
@@ -232,8 +234,9 @@ class Qwen3MoeAttention(nn.Module):
                            self.head_dim)
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
+
+        attn_output = process_qkv(self, positions, q, k, v)
+
         output, _ = self.o_proj(attn_output)
         return output
 
