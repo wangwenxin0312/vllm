@@ -222,8 +222,9 @@ from vllm.v1.attention.backends.utils import (AttentionMetadataBuilder,
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm.forward_context import ForwardContext, get_forward_context
-from vllm.attention.layer import (maybe_execute_sparse_attention_begin,
-                                  maybe_execute_sparse_attention_finished)
+
+from ucm.sparse.state import (maybe_execute_sparse_attention_begin,
+                              maybe_execute_sparse_attention_finished)
 
 try:
     from vllm.vllm_flash_attn import flash_attn_varlen_func
