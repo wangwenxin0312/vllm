@@ -47,7 +47,7 @@ class KVCacheCoordinator(ABC):
     def get_num_blocks_to_allocate(self, request_id: str, num_tokens: int,
                                    new_computed_blocks: tuple[
                                        list[KVCacheBlock], ...],
-                                   num_encoder_tokens: int) -> int:
+                                   num_encoder_tokens: int = 0) -> int:
         """
         Get the number of blocks needed to be allocated for the request.
 
