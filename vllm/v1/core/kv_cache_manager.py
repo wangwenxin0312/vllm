@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
-from typing import Literal, Optional, overload
+from typing import Literal, Optional, overload, Union
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
@@ -11,6 +11,9 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
+
+from ucm.sparse.state import get_ucm_sparse
+from ucm.sparse.base import INVALID_SLOT
 
 logger = init_logger(__name__)
 
@@ -199,6 +202,7 @@ class KVCacheManager:
         num_lookahead_tokens: int = 0,
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
+        num_slots_sparsed: Union[None, int] = None
     ) -> Optional[KVCacheBlocks]:
         """Add slots for a request with new tokens to append.
 
@@ -237,6 +241,10 @@ class KVCacheManager:
         """
         if num_new_tokens == 0:
             raise ValueError("num_new_tokens must be greater than 0")
+
+        if num_slots_sparsed != INVALID_SLOT:
+            return get_ucm_sparse().allocate_slots(self, request, num_slots_sparsed)
+
 
         if new_computed_blocks is not None:
             new_computed_block_list = new_computed_blocks.blocks
