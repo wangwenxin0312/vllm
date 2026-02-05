@@ -240,13 +240,6 @@ class FlashAttentionMetadataBuilder(
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu
         block_table_tensor = common_attn_metadata.block_table_tensor
 
-        if has_ucm_sparse():
-            ucm_sparse = get_ucm_sparse()
-            if os.getenv("VLLM_HASH_ATTENTION") == "1":
-                decode_mask, topk_seq_lens = ucm_sparse.build_decode_attention_meta(
-                    query_start_loc, seq_lens, block_table_tensor
-                )
-
         slot_mapping = common_attn_metadata.slot_mapping
         causal = common_attn_metadata.causal
 

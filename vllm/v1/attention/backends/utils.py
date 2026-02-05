@@ -71,11 +71,10 @@ class CommonAttentionMetadata:
     max_seq_len: int
     """Longest context length in batch"""
 
-    use_rerope: bool
-
     block_table_tensor: torch.Tensor
     slot_mapping: torch.Tensor
 
+    use_rerope: bool = False
     causal: bool = True
 
     # Needed by FastPrefillAttentionBuilder
