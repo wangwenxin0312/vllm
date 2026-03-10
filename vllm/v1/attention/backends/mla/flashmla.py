@@ -110,7 +110,10 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
                 num_splits_view.copy_(num_splits)
                 self.cg_buf_num_splits[n:].fill_(0)  # fill the rest with 0s
                 num_splits = num_splits_view
-                topk_tile_scheduler_metadata, topk_num_splits, topk_seq_lens = ucm_sparse.maybe_init_cudagraph_buffers_for_topk(n, tile_scheduler_metadata, topk_tile_scheduler_metadata, topk_num_splits, topk_seq_lens)
+                if has_ucm_sparse():
+                    ucm_sparse = get_ucm_sparse()
+                    if os.getenv("VLLM_HASH_ATTENTION") == "1":
+                        topk_tile_scheduler_metadata, topk_num_splits, topk_seq_lens = ucm_sparse.maybe_init_cudagraph_buffers_for_topk(n, tile_scheduler_metadata, topk_tile_scheduler_metadata, topk_num_splits, topk_seq_lens)
 
         return FlashMLADecodeMetadata(
             block_table=block_table_tensor,
