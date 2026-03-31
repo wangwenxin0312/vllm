@@ -135,6 +135,14 @@ class CUDAGraphWrapper:
                 # piecewise mode.
                 logger.debug("Capturing a cudagraph on (%s,%s)",
                              self.runtime_mode.name, entry.batch_descriptor)
+            # logger.info(
+            #     "[cudagraph] capture start mode=%s num_tokens=%s uniform_decode=%s "
+            #     "sparse_decode=%s",
+            #     self.runtime_mode.name,
+            #     entry.batch_descriptor.num_tokens,
+            #     entry.batch_descriptor.uniform_decode,
+            #     entry.batch_descriptor.sparse_decode,
+            # )
             # validate that cudagraph capturing is legal at this point.
             validate_cudagraph_capturing_enabled()
 
@@ -194,6 +202,14 @@ class CUDAGraphWrapper:
                 f"Input addresses for cudagraphs are different "
                 f"during replay. Expected {entry.input_addresses}, "
                 f"got {new_input_addresses}")
-
+        
+        # logger.info(
+        #     "[runtime cudagraph] replay mode=%s num_tokens=%s uniform_decode=%s "
+        #     "sparse_decode=%s",
+        #     self.runtime_mode.name,
+        #     entry.batch_descriptor.num_tokens,
+        #     entry.batch_descriptor.uniform_decode,
+        #     entry.batch_descriptor.sparse_decode,
+        # )
         entry.cudagraph.replay()
         return entry.output

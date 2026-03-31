@@ -36,6 +36,7 @@ class BatchDescriptor(NamedTuple):
     """
     num_tokens: int
     uniform_decode: bool = False
+    sparse_decode: bool = False
     """
     False can also be used for an uniform decode batch to dispatch to the 
     cudagraph supporting non-uniform batches.
@@ -46,7 +47,11 @@ class BatchDescriptor(NamedTuple):
         """
         Return a non-uniform version of current batch descriptor.
         """
-        return BatchDescriptor(self.num_tokens, uniform_decode=False)
+        return BatchDescriptor(
+            self.num_tokens,
+            uniform_decode=False,
+            sparse_decode=self.sparse_decode,
+        )
 
 
 def _compute_sp_num_tokens(num_tokens_across_dp_cpu: torch.Tensor,

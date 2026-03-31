@@ -115,7 +115,9 @@ from .utils import (AttentionGroup, MultiModalBudget,
                     gather_mm_placeholders, sanity_check_mm_encoder_outputs,
                     scatter_mm_placeholders)
 
-from ucm.sparse.state import get_ucm_sparse, has_ucm_sparse
+from ucm.sparse.state import (get_ucm_sparse, has_ucm_sparse,
+                              set_current_batch_descriptor_sparse_decode,
+                              update_current_batch_descriptor_for_ucm_sparse)
 from ucm.sparse.base import INVALID_SLOT
 
 if TYPE_CHECKING:
@@ -2631,6 +2633,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 uc_setup_model(self.model)
         ucm_sparse = get_ucm_sparse()
         ucm_sparse.build_sparse_meta(scheduler_output, self.requests, self.input_batch, attn_metadata)
+        update_current_batch_descriptor_for_ucm_sparse()
         ucm_sparse.execute_begin(scheduler_output)
 
     def maybe_execute_ucm_sparse_finished(self, logits_indices):
@@ -2967,6 +2970,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         cudagraph_runtime_mode: Optional[CUDAGraphMode] = None,
         force_attention: bool = False,
         uniform_decode: bool = False,
+        force_ucm_sparse_decode: bool = False,
         allow_microbatching: bool = True,
         skip_eplb: bool = False,
         is_profile: bool = False,
@@ -3092,11 +3096,38 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if ubatch_slices is not None:
                 attn_metadata = [dict() for _ in range(len(ubatch_slices))]
 
+            ucm_sparse_capture_seq_len = None
+            if (force_ucm_sparse_decode and uniform_decode and has_ucm_sparse()):
+                ucm_sparse = get_ucm_sparse()
+    
+                ucm_sparse_capture_seq_len = max(
+                        int(ucm_sparse.seq_len_threshold),
+                        int(ucm_sparse.hash_topk_tokens + ucm_sparse.block_size),
+                    )
+                # min_sparse_capture_reqs = int(
+                #     getattr(ucm_sparse, "concurrency_threshold", 1)
+                # )
+                # if num_reqs >= min_sparse_capture_reqs:
+                #     ucm_sparse_capture_seq_len = max(
+                #         int(ucm_sparse.seq_len_threshold),
+                #         int(ucm_sparse.hash_topk_tokens + ucm_sparse.block_size),
+                #     )
+                # else:
+                #     logger.info(
+                #         "[ucm_sparse-cg] skip sparse dummy seq-lens override: "
+                #         "num_tokens=%s num_reqs=%s min_sparse_capture_reqs=%s",
+                #         num_tokens,
+                #         num_reqs,
+                #         min_sparse_capture_reqs,
+                #     )
+
             if create_mixed_batch:
                 # In the mixed batch mode (used for FI warmup), we use
                 # shorter sequence lengths to run faster.
                 # TODO(luka) better system for describing dummy batches
                 seq_lens = [1] * num_decode_tokens + [num_prefill_tokens + 1]
+            elif ucm_sparse_capture_seq_len is not None:
+                seq_lens = [ucm_sparse_capture_seq_len] * num_reqs
             else:
                 seq_lens = max_query_len
             self.seq_lens.np[:num_reqs] = seq_lens
@@ -3216,6 +3247,26 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
                     ubatch_slices=ubatch_slices):
+                if has_ucm_sparse():
+                    ucm_sparse = get_ucm_sparse()
+                   
+                    set_current_batch_descriptor_sparse_decode(False)
+
+                    if force_ucm_sparse_decode:
+                        prepared = getattr(
+                            ucm_sparse,
+                            "prepare_full_cudagraph_capture",
+                            lambda *_: False,
+                        )(attn_metadata)
+                        # logger.info(
+                        #     "[ucm_sparse-cg] dummy_run sparse capture prep: "
+                        #     "num_tokens=%s uniform_decode=%s prepared=%s",
+                        #     num_tokens,
+                        #     uniform_decode,
+                        #     prepared,
+                        # )
+                        if prepared:
+                            update_current_batch_descriptor_for_ucm_sparse()
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -3578,7 +3629,51 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     num_tokens=num_tokens,
                     uniform_decode=uniform_decode,
                 )
-
+            if (uniform_decode
+                    and cudagraph_runtime_mode == CUDAGraphMode.FULL
+                    and os.getenv("VLLM_HASH_ATTENTION") == "1"
+                    and has_ucm_sparse()):
+                # ucm_sparse = get_ucm_sparse()
+                # if getattr(ucm_sparse, "is_cuda", False):
+                #     sparse_capture_num_reqs = cdiv(
+                #         num_tokens, self.uniform_decode_query_len
+                #     )
+                    # sparse_capture_enabled = (
+                    #     sparse_capture_num_reqs
+                    #     >= int(getattr(ucm_sparse, "concurrency_threshold", 1))
+                    # )
+                    # if not sparse_capture_enabled:
+                    #     logger.info(
+                    #         "[ucm_sparse-cg] skip sparse full capture: num_tokens=%s "
+                    #         "uniform_decode=%s num_reqs=%s concurrency_threshold=%s",
+                    #         num_tokens,
+                    #         uniform_decode,
+                    #         sparse_capture_num_reqs,
+                    #         getattr(ucm_sparse, "concurrency_threshold", 1),
+                    #     )
+                    # else:
+                for _ in range(
+                    self.compilation_config.cudagraph_num_of_warmups
+                ):
+                    self._dummy_run(
+                        num_tokens,
+                        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                        force_attention=True,
+                        uniform_decode=uniform_decode,
+                        force_ucm_sparse_decode=True,
+                        allow_microbatching=allow_microbatching,
+                        skip_eplb=True,
+                        remove_lora=False,
+                    )
+                self._dummy_run(
+                    num_tokens,
+                    cudagraph_runtime_mode=cudagraph_runtime_mode,
+                    uniform_decode=uniform_decode,
+                    force_ucm_sparse_decode=True,
+                    allow_microbatching=allow_microbatching,
+                    skip_eplb=True,
+                    remove_lora=False,
+                )
             for _ in range(self.compilation_config.cudagraph_num_of_warmups):
                 # Use CUDAGraphRuntimeStyle.NONE (default) for warmup.
                 # But be careful, warm up with `NONE`is orthogonal to
