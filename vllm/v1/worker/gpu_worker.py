@@ -35,6 +35,8 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import WorkerBase
 
+from ucm.sparse.state import ensure_ucm_sparse_initialized
+
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
@@ -708,3 +710,4 @@ def init_worker_distributed_environment(
         parallel_config.decode_context_parallel_size)
 
     ensure_kv_transfer_initialized(vllm_config)
+    ensure_ucm_sparse_initialized(vllm_config)
