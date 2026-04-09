@@ -2304,10 +2304,21 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                               == self.uniform_decode_query_len) and (
                                   num_scheduled_tokens
                                   == self.input_batch.num_reqs * max_query_len)
+            self.maybe_execute_ucm_sparse_build_sparse_meta(scheduler_output, attn_metadata)
             batch_descriptor = BatchDescriptor(num_tokens=num_input_tokens,
                                                uniform_decode=uniform_decode)
-            cudagraph_runtime_mode, batch_descriptor = \
-                self.cudagraph_dispatcher.dispatch(batch_descriptor)
+            gsa_batch_descriptor = self._make_gsa_batch_descriptor(batch_descriptor)
+            cudagraph_runtime_mode, batch_descriptor = (
+                self.cudagraph_dispatcher.dispatch(gsa_batch_descriptor)
+            )
+            if has_ucm_sparse() and os.getenv("VLLM_HASH_ATTENTION") == "1":
+                ucm_sparse = get_ucm_sparse()
+                cudagraph_runtime_mode, batch_descriptor = ucm_sparse.adjust_cudagraph_runtime_mode(
+                        cudagraph_runtime_mode,
+                        batch_descriptor,
+                        num_input_tokens,
+                        uniform_decode,
+                    )
 
         # This is currently to get around the assert in the DPMetadata
         # where it wants `num_tokens_across_dp` to align with `num_tokens`
@@ -2621,6 +2632,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
         return draft_token_ids
 
+    def maybe_execute_ucm_sparse_build_sparse_meta(self, scheduler_output: "SchedulerOutput", attn_metadata: CommonAttentionMetadata):
+        if not has_ucm_sparse():
+            return
+        ucm_sparse = get_ucm_sparse()
+        ucm_sparse.build_sparse_meta(scheduler_output, self.requests, self.input_batch, attn_metadata)
+        
     def maybe_execute_ucm_sparse_begin(self, scheduler_output: "SchedulerOutput", attn_metadata: CommonAttentionMetadata):
         if not has_ucm_sparse():
             return
@@ -2630,7 +2647,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if callable(uc_setup_model):
                 uc_setup_model(self.model)
         ucm_sparse = get_ucm_sparse()
-        ucm_sparse.build_sparse_meta(scheduler_output, self.requests, self.input_batch, attn_metadata)
         ucm_sparse.execute_begin(scheduler_output)
 
     def maybe_execute_ucm_sparse_finished(self, logits_indices):
@@ -2638,7 +2654,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             return logits_indices
         ucm_sparse = get_ucm_sparse()
         return ucm_sparse.execute_finished(logits_indices)
-
+    
+    def _make_gsa_batch_descriptor(
+        self, bd: BatchDescriptor
+    ) -> BatchDescriptor:
+        #  Return GsaBatchDescriptor when GSA is active and graph is pre-registered.
+        if not has_ucm_sparse() or os.getenv("VLLM_HASH_ATTENTION") != "1":
+            return bd
+        ucm_sparse = get_ucm_sparse()
+        return ucm_sparse.resolve_batch_descriptor(bd, self.cudagraph_dispatcher)
+        
+    
     def ucm_sparse_request_finished_in_worker(self, request_id: str | int):
         if not has_ucm_sparse():
             return
@@ -2966,6 +2992,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         num_tokens: int,
         cudagraph_runtime_mode: Optional[CUDAGraphMode] = None,
         force_attention: bool = False,
+        force_ucm_attention: bool = False,
         uniform_decode: bool = False,
         allow_microbatching: bool = True,
         skip_eplb: bool = False,
@@ -3216,6 +3243,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
                     ubatch_slices=ubatch_slices):
+                if force_ucm_attention:
+                    if not has_ucm_sparse():
+                        return
+                    ucm_sparse = get_ucm_sparse()
+                    ucm_sparse.build_dummy_sparse_meta(attn_metadata)
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -3601,6 +3633,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             skip_eplb=True,
                             remove_lora=False)
         self.maybe_remove_all_loras(self.lora_config)
+    
+        # ------------------------------------------------------------------
+        # GSA-on graph capture
+        # ------------------------------------------------------------------
+        if has_ucm_sparse() and os.getenv("VLLM_HASH_ATTENTION") == "1":
+            ucm_sparse = get_ucm_sparse()
+            ucm_sparse.maybe_capture_extra_cudagraphs(
+                    self, compilation_cases, cudagraph_runtime_mode, uniform_decode
+                )
+
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
         """
