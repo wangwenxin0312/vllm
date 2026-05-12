@@ -82,6 +82,7 @@ class SingleTypeKVCacheManager(ABC):
         new_computed_blocks: Sequence[KVCacheBlock],
         total_computed_tokens: int,
         num_tokens_main_model: int,
+        num_external_computed_tokens: int = 0,
     ) -> int:
         """
         Get the number of blocks needed to be allocated for the request.
@@ -97,6 +98,8 @@ class SingleTypeKVCacheManager(ABC):
             num_tokens_main_model: The number of tokens for the main model (aka target
                 model in spec decode). w/o spec decode, it is num_tokens;
                 with spec decode, it is num_tokens - num_lookahead_tokens.
+            num_external_computed_tokens: The number of external computed
+                tokens that need local KV slots for connector load.
 
         Returns:
             The number of blocks to allocate.
@@ -866,6 +869,7 @@ class MambaManager(SingleTypeKVCacheManager):
         new_computed_blocks: Sequence[KVCacheBlock],
         total_computed_tokens: int,
         num_tokens_main_model: int,
+        num_external_computed_tokens: int = 0,
     ) -> int:
         assert isinstance(self.kv_cache_spec, MambaSpec)
         if (
@@ -890,6 +894,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 new_computed_blocks,
                 total_computed_tokens,
                 num_tokens_main_model,
+                num_external_computed_tokens=num_external_computed_tokens,
             )
         else:
             # We don't allocate blocks for lookahead tokens in align mode, because if
@@ -899,30 +904,79 @@ class MambaManager(SingleTypeKVCacheManager):
             # mamba layers.
             num_tokens = num_tokens_main_model
 
-            # NOTE(tdouble): this is an over-estimate of how many blocks we need because
-            # num_tokens can include draft tokens that will later be rejected.
+            req_blocks = self.req_to_blocks[request_id]
+            num_blocks_to_allocate = 0
+
+            if request_id in self.num_cached_block:
+                req_len_after_computed = len(req_blocks)
+            else:
+                num_skipped_tokens = self.get_num_skipped_tokens(
+                    total_computed_tokens
+                )
+                num_skipped_blocks = num_skipped_tokens // self.block_size
+                if num_skipped_blocks > 0:
+                    computed_blocks_after_skip = new_computed_blocks[
+                        num_skipped_blocks:
+                    ]
+                    num_external_computed_tokens = min(
+                        total_computed_tokens - num_skipped_tokens,
+                        num_external_computed_tokens,
+                    )
+                else:
+                    computed_blocks_after_skip = new_computed_blocks
+
+                # allocate_new_computed_blocks() touches exactly this post-skip
+                # slice, removing evictable cached blocks from the free queue.
+                num_blocks_to_allocate += self._get_num_evictable_blocks(
+                    computed_blocks_after_skip
+                )
+
+                req_len_after_computed = (
+                    num_skipped_blocks + len(computed_blocks_after_skip)
+                )
+                if num_external_computed_tokens > 0:
+                    num_external_blocks = max(
+                        cdiv(total_computed_tokens, self.block_size)
+                        - req_len_after_computed,
+                        0,
+                    )
+                    num_blocks_to_allocate += num_external_blocks
+                    req_len_after_computed += num_external_blocks
+
+            # NOTE(tdouble): this is an over-estimate of how many blocks we need
+            # because num_tokens can include draft tokens that will later be
+            # rejected.
             num_required_blocks = (
                 cdiv(num_tokens, self.block_size) + self.num_speculative_blocks
             )
-            num_new_blocks = (
-                num_required_blocks
-                - len(new_computed_blocks)
-                - len(self.req_to_blocks[request_id])
-            )
-            if num_new_blocks > 0:
-                if request_id in self._allocated_block_reqs:
-                    # Old request. Needs at most 1 more blocks as we can reuse the
-                    # speculative blocks in previous step.
-                    num_new_blocks = 1
-                else:
-                    # First prefill. Allocate 1 block for running state and the
-                    # speculative blocks.
-                    num_new_blocks = 1 + self.num_speculative_blocks
+            if num_required_blocks <= req_len_after_computed:
+                return num_blocks_to_allocate
 
-            num_evictable_computed_blocks = self._get_num_evictable_blocks(
-                new_computed_blocks
+            # Mirror allocate_new_blocks(): align mode may first append null
+            # blocks, and running requests can reuse previous speculative blocks
+            # without consuming free blocks.
+            req_len_before_new_alloc = req_len_after_computed
+            num_skipped_blocks = (
+                num_required_blocks - self.num_speculative_blocks - 1
             )
-            return num_new_blocks + num_evictable_computed_blocks
+            if req_len_before_new_alloc < num_skipped_blocks:
+                req_len_before_new_alloc = num_skipped_blocks
+
+            if request_id in self._allocated_block_reqs:
+                for block_idx in range(
+                    req_len_after_computed - self.num_speculative_blocks,
+                    req_len_after_computed,
+                ):
+                    if block_idx < num_skipped_blocks:
+                        req_len_before_new_alloc += 1
+                    else:
+                        break
+
+            num_blocks_to_allocate += max(
+                num_required_blocks - req_len_before_new_alloc,
+                0,
+            )
+            return num_blocks_to_allocate
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
